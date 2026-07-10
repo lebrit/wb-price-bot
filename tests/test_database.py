@@ -1,0 +1,229 @@
+from __future__ import annotations
+
+import asyncio
+from datetime import timedelta
+from pathlib import Path
+
+import pytest
+
+from wb_price_bot.config import Settings
+from wb_price_bot.database import (
+    Database,
+    ProductAlreadyExistsError,
+    ProductLimitError,
+)
+from wb_price_bot.domain import PriceSnapshot, ThresholdKind, utcnow
+
+from .conftest import make_snapshot
+
+
+@pytest.mark.asyncio
+async def test_database_product_lifecycle_and_alerts(settings: Settings) -> None:
+    database = Database(settings.database_path)
+    await database.initialize()
+    await database.ensure_user(1001, "owner", "Owner", is_admin=True)
+    product = await database.add_product(
+        telegram_id=1001,
+        snapshot=make_snapshot(price=100_000),
+        threshold_kind=ThresholdKind.PERCENT,
+        threshold_value=1000,
+        max_products=20,
+    )
+    with pytest.raises(ProductAlreadyExistsError):
+        await database.add_product(
+            telegram_id=1001,
+            snapshot=make_snapshot(price=100_000),
+            threshold_kind=ThresholdKind.PERCENT,
+            threshold_value=1000,
+            max_products=20,
+        )
+
+    no_alert = await database.apply_snapshot(product.id, make_snapshot(price=95_000))
+    assert no_alert is None
+    alert = await database.apply_snapshot(product.id, make_snapshot(price=89_000))
+    assert alert is not None
+    assert alert.decision.kind == "price_drop"
+    assert alert.decision.reference_price == 100_000
+
+    updated = await database.get_product(1001, product.id)
+    assert updated is not None
+    assert updated.reference_price == 89_000
+    assert updated.lowest_price == 89_000
+
+    source_change = await database.apply_snapshot(
+        product.id, make_snapshot(price=80_000, source="account_browser")
+    )
+    assert source_change is None
+    updated = await database.get_product(1001, product.id)
+    assert updated is not None
+    assert updated.reference_price == 80_000
+    assert updated.price_source == "account_browser"
+
+    history = await database.recent_history(1001, product.id, limit=20)
+    assert [row.price for row in history] == [80_000, 89_000, 95_000, 100_000]
+    assert await database.delete_product(1002, product.id) is False
+    assert await database.delete_product(1001, product.id) is True
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_out_of_stock_never_overwrites_known_price(settings: Settings) -> None:
+    database = Database(settings.database_path)
+    await database.initialize()
+    await database.ensure_user(1001, None, "Owner", is_admin=True)
+    product = await database.add_product(
+        telegram_id=1001,
+        snapshot=make_snapshot(price=100_000),
+        threshold_kind=ThresholdKind.AMOUNT,
+        threshold_value=5000,
+        max_products=20,
+    )
+    snapshot = make_snapshot(price=None, available=False, quantity=0)
+    assert await database.apply_snapshot(product.id, snapshot) is None
+    updated = await database.get_product(1001, product.id)
+    assert updated is not None
+    assert updated.current_price == 100_000
+    assert updated.is_available is False
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_backup_is_consistent(settings: Settings, tmp_path: Path) -> None:
+    database = Database(settings.database_path)
+    await database.initialize()
+    await database.ensure_user(1001, None, "Owner", is_admin=True)
+    destination = tmp_path / "backup" / "copy.sqlite3"
+    await database.backup_to(destination)
+    assert destination.exists()
+    assert await database.integrity_check() == "ok"
+    backup_db = Database(destination)
+    await backup_db.initialize()
+    assert await backup_db.integrity_check() == "ok"
+    await backup_db.close()
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_product_limit_is_atomic_for_concurrent_adds(settings: Settings) -> None:
+    database = Database(settings.database_path)
+    await database.initialize()
+    await database.ensure_user(1001, None, "Owner", is_admin=True)
+
+    async def add(nm_id: int) -> object:
+        return await database.add_product(
+            telegram_id=1001,
+            snapshot=make_snapshot(nm_id=nm_id),
+            threshold_kind=ThresholdKind.PERCENT,
+            threshold_value=1000,
+            max_products=1,
+        )
+
+    results = await asyncio.gather(
+        *(add(28_436_956 + index) for index in range(5)), return_exceptions=True
+    )
+    products, total = await database.list_products(1001)
+    assert total == len(products) == 1
+    assert sum(isinstance(item, ProductLimitError) for item in results) == 4
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_alert_is_persisted_until_marked_sent(settings: Settings) -> None:
+    database = Database(settings.database_path)
+    await database.initialize()
+    await database.ensure_user(1001, None, "Owner", is_admin=True)
+    product = await database.add_product(
+        telegram_id=1001,
+        snapshot=make_snapshot(price=100_000),
+        threshold_kind=ThresholdKind.AMOUNT,
+        threshold_value=5000,
+        max_products=20,
+    )
+
+    alert = await database.apply_snapshot(product.id, make_snapshot(price=90_000))
+    assert alert is not None
+    pending = await database.pending_alerts()
+    assert [item.outbox_id for item in pending] == [alert.outbox_id]
+    assert (await database.stats()).alerts_pending == 1
+
+    await database.mark_alert_sent(alert.outbox_id)
+    assert await database.pending_alerts() == []
+    assert (await database.stats()).alerts_pending == 0
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_deleting_product_discards_pending_alert(settings: Settings) -> None:
+    database = Database(settings.database_path)
+    await database.initialize()
+    await database.ensure_user(1001, None, "Owner", is_admin=True)
+    product = await database.add_product(
+        telegram_id=1001,
+        snapshot=make_snapshot(price=100_000),
+        threshold_kind=ThresholdKind.AMOUNT,
+        threshold_value=5000,
+        max_products=20,
+    )
+    assert await database.apply_snapshot(product.id, make_snapshot(price=90_000)) is not None
+    assert (await database.stats()).alerts_pending == 1
+
+    assert await database.delete_product(1001, product.id) is True
+    assert await database.pending_alerts() == []
+    assert (await database.stats()).alerts_pending == 0
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_replacing_account_resets_price_context(settings: Settings) -> None:
+    database = Database(settings.database_path)
+    await database.initialize()
+    await database.ensure_user(1001, None, "Owner", is_admin=True)
+    product = await database.add_product(
+        telegram_id=1001,
+        snapshot=make_snapshot(price=100_000, source="account_browser"),
+        threshold_kind=ThresholdKind.PERCENT,
+        threshold_value=1000,
+        max_products=20,
+    )
+
+    await database.save_wb_account(1001, "encrypted-session-a")
+    await database.save_wb_account(1001, "encrypted-session-b")
+    updated = await database.get_product(1001, product.id)
+    assert updated is not None
+    assert updated.reference_price is None
+    assert updated.alert_latched is False
+    assert updated.price_source == "context_reset"
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_active_targets_respect_current_allowlist(settings: Settings) -> None:
+    database = Database(settings.database_path)
+    await database.initialize()
+    for telegram_id in (1001, 1002):
+        await database.ensure_user(telegram_id, None, "Owner", is_admin=True)
+        await database.add_product(
+            telegram_id=telegram_id,
+            snapshot=make_snapshot(),
+            threshold_kind=ThresholdKind.PERCENT,
+            threshold_value=1000,
+            max_products=20,
+        )
+
+    targets = await database.active_targets({1002})
+    assert [item.telegram_id for item in targets] == [1002]
+    await database.close()
+
+
+def shifted_snapshot(snapshot: PriceSnapshot, *, minutes: int) -> PriceSnapshot:
+    return PriceSnapshot(
+        nm_id=snapshot.nm_id,
+        title=snapshot.title,
+        brand=snapshot.brand,
+        price=snapshot.price,
+        basic_price=snapshot.basic_price,
+        available=snapshot.available,
+        quantity=snapshot.quantity,
+        source=snapshot.source,
+        observed_at=utcnow() + timedelta(minutes=minutes),
+    )

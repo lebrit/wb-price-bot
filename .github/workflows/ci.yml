@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy
+      - run: pytest
+      - run: python -m compileall -q src scripts tests
+      - run: bash -n scripts/install.sh
+      - run: python -m pip install pip-audit
+      - run: python -m pip_audit -r requirements.lock
+
+  container:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose model
+        run: |
+          mkdir -p data secrets
+          touch secrets/telegram-token secrets/session-key
+          cp .env.example .env
+          docker compose config >/dev/null
+      - name: Build image
+        run: docker build -t wb-price-bot:ci .
