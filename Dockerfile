@@ -19,9 +19,10 @@ RUN apt-get update \
     && python -m playwright install --with-deps chromium \
     && groupadd --gid 10001 app \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin app \
-    && mkdir -p /data /ms-playwright \
+    && mkdir -p /data /ms-playwright /tmp/.X11-unix \
     && chown -R 10001:10001 /data /ms-playwright \
-    && chmod -R a+rX /ms-playwright
+    && chmod -R a+rX /ms-playwright \
+    && chmod 1777 /tmp /tmp/.X11-unix
 
 USER 10001:10001
 

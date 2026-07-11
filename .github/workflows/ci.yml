@@ -47,5 +47,8 @@ jobs:
         run: docker build -t wb-price-bot:ci .
       - name: Smoke test container entrypoint
         run: >-
-          docker run --rm wb-price-bot:ci
+          docker run --rm --init
+          --tmpfs /tmp:size=256m,noexec,nosuid
+          --tmpfs /tmp/.X11-unix:mode=1777
+          wb-price-bot:ci
           python -m wb_price_bot version | grep -Fx 0.3.1

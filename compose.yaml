@@ -27,6 +27,7 @@ services:
       - ${WB_SECRETS_DIR:-./secrets}:/run/secrets:ro
     tmpfs:
       - /tmp:size=256m,noexec,nosuid
+      - /tmp/.X11-unix:mode=1777
     stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "python", "-m", "wb_price_bot", "healthcheck"]
@@ -58,6 +59,7 @@ services:
     volumes: *app_volumes
     tmpfs:
       - /tmp:size=512m,noexec,nosuid
+      - /tmp/.X11-unix:mode=1777
     depends_on:
       bot:
         condition: service_healthy
