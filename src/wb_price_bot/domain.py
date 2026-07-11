@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import StrEnum
 from urllib.parse import urlparse
@@ -34,6 +34,10 @@ class PriceSnapshot:
     quantity: int
     source: str
     observed_at: datetime
+    option_id: int | None = None
+    size_name: str | None = None
+    supplier_id: int | None = None
+    supplier_name: str | None = None
 
     @property
     def url(self) -> str:
@@ -47,6 +51,40 @@ class AlertDecision:
     current_price: int | None
     drop_amount: int = 0
     drop_basis_points: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class VariantSelection:
+    option_id: int | None = None
+    size_name: str | None = None
+    supplier_id: int | None = None
+    supplier_name: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GeoRegion:
+    destination: int
+    latitude: float
+    longitude: float
+    label: str
+
+
+@dataclass(slots=True)
+class PriceRuleState:
+    id: int
+    kind: ThresholdKind
+    value: int
+    reference_price: int | None
+    alert_latched: bool = False
+    is_active: bool = True
+    last_alert_at: datetime | None = None
+
+    def label(self) -> str:
+        if self.kind is ThresholdKind.PERCENT:
+            return f"снижение на {self.value / 100:g}%"
+        if self.kind is ThresholdKind.AMOUNT:
+            return f"снижение на {format_money(self.value)}"
+        return f"цена не выше {format_money(self.value)}"
 
 
 def is_allowed_wb_host(host: str | None) -> bool:
@@ -172,6 +210,32 @@ def evaluate_alert(
             False,
         )
     return None, reference_price, False
+
+
+def is_quiet_time(start_minute: int | None, end_minute: int | None, value: time) -> bool:
+    if start_minute is None or end_minute is None or start_minute == end_minute:
+        return False
+    minute = value.hour * 60 + value.minute
+    if start_minute < end_minute:
+        return start_minute <= minute < end_minute
+    return minute >= start_minute or minute < end_minute
+
+
+def parse_clock(value: str) -> int:
+    match = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", value)
+    if match is None:
+        raise ValueError("Введите время в формате ЧЧ:ММ")
+    hour, minute = map(int, match.groups())
+    if hour > 23 or minute > 59:
+        raise ValueError("Введите время от 00:00 до 23:59")
+    return hour * 60 + minute
+
+
+def format_clock(value: int | None) -> str:
+    if value is None:
+        return "выключено"
+    hour, minute = divmod(value, 60)
+    return f"{hour:02d}:{minute:02d}"
 
 
 def utcnow() -> datetime:

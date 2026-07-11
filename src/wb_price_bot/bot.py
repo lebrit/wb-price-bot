@@ -13,7 +13,7 @@ from .database import Database
 from .handlers import HandlerContext, create_router
 from .monitor import PriceMonitor
 from .security import SessionCipher
-from .wildberries import AccountWildberriesClient, PublicWildberriesClient
+from .wildberries import AccountWildberriesClient, MpstatsPriceClient, PublicWildberriesClient
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +25,7 @@ async def run_bot(settings: Settings) -> None:
     cipher = SessionCipher(settings.session_encryption_key)
     public_client = PublicWildberriesClient(settings)
     account_client = AccountWildberriesClient(settings)
+    licensed_client = MpstatsPriceClient(settings)
     bot = Bot(
         token=settings.telegram_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -35,6 +36,7 @@ async def run_bot(settings: Settings) -> None:
         bot=bot,
         public_client=public_client,
         account_client=account_client,
+        licensed_client=licensed_client,
         cipher=cipher,
     )
     dispatcher = Dispatcher()
@@ -45,6 +47,7 @@ async def run_bot(settings: Settings) -> None:
                 database=database,
                 public_client=public_client,
                 account_client=account_client,
+                licensed_client=licensed_client,
                 cipher=cipher,
                 monitor=monitor,
             )
@@ -56,6 +59,10 @@ async def run_bot(settings: Settings) -> None:
             BotCommand(command="add", description="Добавить товар"),
             BotCommand(command="list", description="Мои товары"),
             BotCommand(command="account", description="Аккаунт Wildberries"),
+            BotCommand(command="settings", description="Регион и уведомления"),
+            BotCommand(command="import", description="Массовый импорт"),
+            BotCommand(command="export", description="Экспорт CSV/JSON"),
+            BotCommand(command="folders", description="Папки и теги"),
             BotCommand(command="status", description="Состояние сервиса"),
             BotCommand(command="help", description="Помощь"),
             BotCommand(command="cancel", description="Отменить ввод"),
@@ -77,5 +84,6 @@ async def run_bot(settings: Settings) -> None:
         except TimeoutError:
             monitor_task.cancel()
         await public_client.close()
+        await licensed_client.close()
         await bot.session.close()
         await database.close()

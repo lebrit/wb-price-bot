@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 import httpx
 import pytest
 
 from wb_price_bot.config import Settings
+from wb_price_bot.domain import VariantSelection
 from wb_price_bot.wildberries import (
+    MpstatsPriceClient,
     ProductReferenceError,
     PublicWildberriesClient,
     WildberriesError,
@@ -19,13 +25,21 @@ def _product_payload() -> dict[str, object]:
                 "id": 28436956,
                 "name": "Краска по ткани",
                 "brand": "Pebeo",
+                "supplier": "PalANtir",
+                "supplierId": 134034,
                 "totalQuantity": 7,
                 "sizes": [
                     {
+                        "name": "S",
+                        "origName": "42",
+                        "optionId": 1001,
                         "stocks": [{"qty": 0}],
                         "price": {"basic": 200_000, "product": 100_000, "logistics": 0},
                     },
                     {
+                        "name": "M",
+                        "origName": "44",
+                        "optionId": 1002,
                         "stocks": [{"qty": 7}],
                         "price": {"basic": 180_000, "product": 95_000, "logistics": 500},
                     },
@@ -61,6 +75,12 @@ async def test_public_client_parses_available_price_with_logistics(settings: Set
     assert first.basic_price == 180_000
     assert first.quantity == 7
     assert first.available is True
+    assert first.size_name == "M"
+    assert first.supplier_id == 134034
+    assert len(result.variants[28436956]) == 2
+    selected = result.select(28436956, VariantSelection(option_id=1001))
+    assert selected is not None and selected.price == 100_000
+    assert selected.available is False
     second = result.products[30379219]
     assert second.price is None and second.available is False
     assert seen_url is not None
@@ -139,3 +159,82 @@ async def test_short_link_external_redirect_is_rejected(settings: Settings) -> N
 def test_parse_price_text() -> None:
     assert parse_price_text("с WB Кошельком 1 199 ₽") == 119_900
     assert parse_price_text("нет цены") is None
+
+
+@pytest.mark.asyncio
+async def test_geo_location_resolves_destination(settings: Settings) -> None:
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200,
+                json={
+                    "xinfo": "appType=1&curr=rub&dest=-5827722&spp=30",
+                    "address": "ignored",
+                },
+            )
+        )
+    )
+    client = PublicWildberriesClient(settings, http)
+    region = await client.resolve_geo(52.286974, 104.305018)
+    assert region.destination == -5827722
+    assert region.label == "52.28697, 104.30502"
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_mpstats_licensed_provider_parses_price(settings: Settings) -> None:
+    configured = replace(settings, mpstats_token="licensed-token")
+    updated = datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d %H:%M:%S")
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "id": 28436956,
+                    "name": "Товар",
+                    "brand": "Brand",
+                    "seller": {"id": 77, "name": "Seller"},
+                    "stock": {"fbo": 4, "fbs": 1},
+                    "price": {"price": 1000, "final_price": 675},
+                    "updated": updated,
+                },
+                request=request,
+            )
+        )
+    )
+    client = MpstatsPriceClient(configured, http)
+    result = await client.fetch_many([28436956])
+    snapshot = result.products[28436956]
+    assert snapshot.price == 67_500
+    assert snapshot.basic_price == 100_000
+    assert snapshot.quantity == 5
+    assert snapshot.supplier_id == 77
+    assert snapshot.source == "licensed_mpstats"
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_mpstats_rejects_stale_data(settings: Settings) -> None:
+    configured = replace(settings, mpstats_token="licensed-token", mpstats_max_age_hours=24)
+    stale = (datetime.now(ZoneInfo("Europe/Moscow")) - timedelta(days=3)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "name": "Товар",
+                    "stock": {"fbo": 1},
+                    "price": {"price": 1000, "final_price": 675},
+                    "updated": stale,
+                },
+                request=request,
+            )
+        )
+    )
+    client = MpstatsPriceClient(configured, http)
+    result = await client.fetch_many([28436956])
+    assert result.products == {}
+    assert "stale data" in result.errors[28436956]
+    await http.aclose()

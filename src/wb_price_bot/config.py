@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 class ConfigurationError(RuntimeError):
@@ -73,6 +74,13 @@ class Settings:
     log_level: str = "INFO"
     wb_api_url: str = "https://card.wb.ru/cards/v4/detail"
     wb_browser_headless: bool = False
+    timezone_name: str = "Asia/Irkutsk"
+    max_bulk_import: int = 50
+    max_rules_per_product: int = 10
+    wb_geo_url: str = "https://user-geo-data.wildberries.ru/get-geo-info"
+    mpstats_token: str = ""
+    mpstats_api_url: str = "https://mpstats.io/api/analytics/v1/wb"
+    mpstats_max_age_hours: int = 24
 
     @property
     def database_path(self) -> Path:
@@ -93,6 +101,14 @@ class Settings:
         except ValueError as exc:
             raise ConfigurationError("WB_DESTINATION должен быть целым числом") from exc
 
+        timezone_name = os.getenv("APP_TIMEZONE", "Asia/Irkutsk").strip()
+        try:
+            ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError as exc:
+            raise ConfigurationError(
+                "APP_TIMEZONE должна быть IANA-зоной, например Asia/Irkutsk"
+            ) from exc
+
         return cls(
             telegram_token=token,
             session_encryption_key=encryption_key,
@@ -109,4 +125,15 @@ class Settings:
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
             wb_api_url=os.getenv("WB_API_URL", "https://card.wb.ru/cards/v4/detail").strip(),
             wb_browser_headless=_boolean("WB_BROWSER_HEADLESS", False),
+            timezone_name=timezone_name,
+            max_bulk_import=_positive_int("MAX_BULK_IMPORT", 50, 1),
+            max_rules_per_product=_positive_int("MAX_RULES_PER_PRODUCT", 10, 1),
+            wb_geo_url=os.getenv(
+                "WB_GEO_URL", "https://user-geo-data.wildberries.ru/get-geo-info"
+            ).strip(),
+            mpstats_token=_read_secret("MPSTATS_TOKEN"),
+            mpstats_api_url=os.getenv(
+                "MPSTATS_API_URL", "https://mpstats.io/api/analytics/v1/wb"
+            ).strip(),
+            mpstats_max_age_hours=_positive_int("MPSTATS_MAX_AGE_HOURS", 24, 1),
         )

@@ -17,7 +17,7 @@ def main_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="➕ Добавить товар"), KeyboardButton(text="📦 Мои товары")],
             [KeyboardButton(text="👤 Аккаунт WB"), KeyboardButton(text="🩺 Статус")],
-            [KeyboardButton(text="❓ Помощь")],
+            [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="❓ Помощь")],
         ],
         resize_keyboard=True,
         input_field_placeholder="Выберите действие",
@@ -33,6 +33,27 @@ def threshold_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="Отмена", callback_data="cancel")],
         ]
     )
+
+
+def variant_keyboard(
+    variants: list[tuple[int, str, int | None, bool]],
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="🔎 Минимальная доступная цена", callback_data="addvariant:0")]
+    ]
+    for option_id, name, price, available in variants[:30]:
+        state = "🟢" if available else "⚪"
+        price_label = f" — {price / 100:g} ₽" if price else ""
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{state} {name}{price_label}",
+                    callback_data=f"addvariant:{option_id}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def products_keyboard(
@@ -67,9 +88,126 @@ def product_keyboard(product: Product) -> InlineKeyboardMarkup:
                 ),
                 InlineKeyboardButton(text="📈 История", callback_data=f"history:{product.id}"),
             ],
+            [
+                InlineKeyboardButton(text="📊 График", callback_data=f"charts:{product.id}"),
+                InlineKeyboardButton(text="🔔 Правила", callback_data=f"rules:{product.id}"),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📐 Размер и продавец", callback_data=f"variantedit:{product.id}"
+                )
+            ],
+            [InlineKeyboardButton(text="🏷 Организация", callback_data=f"organize:{product.id}")],
             [InlineKeyboardButton(text=toggle, callback_data=f"toggle:{product.id}")],
             [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"deleteask:{product.id}")],
             [InlineKeyboardButton(text="⬅️ К списку", callback_data="products:0")],
+        ]
+    )
+
+
+def edit_variant_keyboard(
+    product_id: int, variants: list[tuple[int, str, int | None, bool]]
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text="🔎 Минимальная доступная цена",
+                callback_data=f"variantset:{product_id}:0",
+            )
+        ]
+    ]
+    for option_id, name, price, available in variants[:30]:
+        state = "🟢" if available else "⚪"
+        price_label = f" — {price / 100:g} ₽" if price else ""
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{state} {name}{price_label}",
+                    callback_data=f"variantset:{product_id}:{option_id}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="⬅️ К товару", callback_data=f"product:{product_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def charts_keyboard(product_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="7 дней", callback_data=f"chart:{product_id}:7"),
+                InlineKeyboardButton(text="30 дней", callback_data=f"chart:{product_id}:30"),
+                InlineKeyboardButton(text="90 дней", callback_data=f"chart:{product_id}:90"),
+            ],
+            [InlineKeyboardButton(text="⬅️ К товару", callback_data=f"product:{product_id}")],
+        ]
+    )
+
+
+def rules_keyboard(product_id: int, rule_ids: list[int]) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"🗑 Удалить правило {rule_id}",
+                callback_data=f"ruledel:{product_id}:{rule_id}",
+            )
+        ]
+        for rule_id in rule_ids
+    ]
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    text="➕ Добавить правило", callback_data=f"ruleadd:{product_id}"
+                )
+            ],
+            [InlineKeyboardButton(text="⬅️ К товару", callback_data=f"product:{product_id}")],
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def settings_keyboard(digest_enabled: bool, quiet_enabled: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📍 Регион по геопозиции", callback_data="settings:region")],
+            [
+                InlineKeyboardButton(
+                    text="🌙 Изменить тихие часы" if quiet_enabled else "🌙 Включить тихие часы",
+                    callback_data="settings:quiet",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📋 Выключить сводку" if digest_enabled else "📋 Включить дневную сводку",
+                    callback_data="settings:digest_toggle",
+                ),
+                InlineKeyboardButton(text="🕘 Время сводки", callback_data="settings:digest_time"),
+            ],
+            [InlineKeyboardButton(text="📥 Массовый импорт", callback_data="bulk:start")],
+            [InlineKeyboardButton(text="📤 Экспорт", callback_data="export:show")],
+        ]
+    )
+
+
+def location_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📍 Отправить геопозицию", request_location=True)],
+            [KeyboardButton(text="Отмена")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def export_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="CSV", callback_data="export:csv"),
+                InlineKeyboardButton(text="JSON", callback_data="export:json"),
+            ]
         ]
     )
 

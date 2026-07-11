@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from collections import defaultdict
 from collections.abc import Sequence, Set
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -18,7 +19,15 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from .domain import AlertDecision, PriceSnapshot, ThresholdKind, evaluate_alert, utcnow
+from .domain import (
+    AlertDecision,
+    PriceRuleState,
+    PriceSnapshot,
+    ThresholdKind,
+    VariantSelection,
+    evaluate_alert,
+    utcnow,
+)
 from .models import (
     Base,
     NotificationOutbox,
@@ -46,6 +55,11 @@ class WatchTarget:
     nm_id: int
     encrypted_session: str | None
     account_status: str | None
+    destination: int
+    option_id: int | None
+    size_name: str | None
+    supplier_id: int | None
+    supplier_name: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +73,53 @@ class PendingAlert:
     source: str
     decision: AlertDecision
     attempts: int = 0
+    rule_kind: ThresholdKind | None = None
+    rule_value: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationPreferences:
+    telegram_id: int
+    quiet_start_minute: int | None
+    quiet_end_minute: int | None
+    daily_digest_enabled: bool
+    daily_digest_minute: int
+    last_digest_date: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DigestItem:
+    title: str
+    canonical_url: str
+    current_price: int | None
+    first_price: int | None
+    is_available: bool
+
+
+_MIGRATION_COLUMNS: dict[str, dict[str, str]] = {
+    "users": {
+        "wb_destination": "INTEGER",
+        "region_label": "VARCHAR(200)",
+        "quiet_start_minute": "INTEGER",
+        "quiet_end_minute": "INTEGER",
+        "daily_digest_enabled": "BOOLEAN NOT NULL DEFAULT 0",
+        "daily_digest_minute": "INTEGER NOT NULL DEFAULT 540",
+        "last_digest_date": "VARCHAR(10)",
+    },
+    "products": {
+        "rules_json": "TEXT NOT NULL DEFAULT '[]'",
+        "option_id": "BIGINT",
+        "size_name": "VARCHAR(100)",
+        "supplier_id": "BIGINT",
+        "supplier_name": "VARCHAR(200)",
+        "folder_name": "VARCHAR(100)",
+        "tags_json": "TEXT NOT NULL DEFAULT '[]'",
+    },
+    "notification_outbox": {
+        "rule_kind": "VARCHAR(20)",
+        "rule_value": "INTEGER",
+    },
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +154,36 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         async with self._engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+            for table, columns in _MIGRATION_COLUMNS.items():
+                existing = {
+                    str(row[1])
+                    for row in (await connection.exec_driver_sql(f"PRAGMA table_info({table})"))
+                }
+                for column, definition in columns.items():
+                    if column not in existing:
+                        await connection.exec_driver_sql(
+                            f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                        )
+        await self._migrate_legacy_rules()
+
+    async def _migrate_legacy_rules(self) -> None:
+        async with self._sessions() as session, session.begin():
+            products = list((await session.scalars(select(Product))).all())
+            for product in products:
+                if _load_rules(product.rules_json):
+                    continue
+                product.rules_json = _dump_rules(
+                    [
+                        PriceRuleState(
+                            id=1,
+                            kind=ThresholdKind(product.threshold_kind),
+                            value=product.threshold_value,
+                            reference_price=product.reference_price,
+                            alert_latched=product.alert_latched,
+                            last_alert_at=normalize_datetime(product.last_alert_at),
+                        )
+                    ]
+                )
 
     async def close(self) -> None:
         await self._engine.dispose()
@@ -142,6 +233,7 @@ class Database:
         threshold_kind: ThresholdKind,
         threshold_value: int,
         max_products: int,
+        selection: VariantSelection | None = None,
     ) -> Product:
         async with self._user_locks[telegram_id]:
             async with self._sessions() as session, session.begin():
@@ -159,6 +251,18 @@ class Database:
                 if duplicate is not None:
                     raise ProductAlreadyExistsError("Этот товар уже отслеживается")
 
+                selection = selection or VariantSelection(
+                    option_id=snapshot.option_id,
+                    size_name=snapshot.size_name,
+                    supplier_id=snapshot.supplier_id,
+                    supplier_name=snapshot.supplier_name,
+                )
+                initial_rule = PriceRuleState(
+                    id=1,
+                    kind=threshold_kind,
+                    value=threshold_value,
+                    reference_price=snapshot.price,
+                )
                 product = Product(
                     user_id=user.id,
                     nm_id=snapshot.nm_id,
@@ -167,6 +271,11 @@ class Database:
                     canonical_url=snapshot.url,
                     threshold_kind=threshold_kind.value,
                     threshold_value=threshold_value,
+                    rules_json=_dump_rules([initial_rule]),
+                    option_id=selection.option_id,
+                    size_name=selection.size_name,
+                    supplier_id=selection.supplier_id,
+                    supplier_name=selection.supplier_name,
                     is_available=snapshot.available,
                     current_price=snapshot.price,
                     reference_price=snapshot.price,
@@ -195,30 +304,134 @@ class Database:
                 return product
 
     async def list_products(
-        self, telegram_id: int, *, offset: int = 0, limit: int = 10
+        self,
+        telegram_id: int,
+        *,
+        offset: int = 0,
+        limit: int = 10,
+        folder: str | None = None,
+        tag: str | None = None,
     ) -> tuple[list[Product], int]:
         async with self._sessions() as session:
             user_id = await session.scalar(select(User.id).where(User.telegram_id == telegram_id))
             if user_id is None:
                 return [], 0
-            total = int(
-                await session.scalar(
-                    select(func.count()).select_from(Product).where(Product.user_id == user_id)
-                )
-                or 0
-            )
             products = list(
                 (
                     await session.scalars(
                         select(Product)
                         .where(Product.user_id == user_id)
                         .order_by(Product.created_at.desc())
-                        .offset(offset)
-                        .limit(limit)
                     )
                 ).all()
             )
-            return products, total
+            if folder is not None:
+                products = [item for item in products if item.folder_name == folder]
+            if tag is not None:
+                products = [
+                    item
+                    for item in products
+                    if tag.casefold() in {value.casefold() for value in _load_tags(item.tags_json)}
+                ]
+            total = len(products)
+            return products[offset : offset + limit], total
+
+    async def product_rules(self, telegram_id: int, product_id: int) -> list[PriceRuleState]:
+        product = await self.get_product(telegram_id, product_id)
+        return _load_rules(product.rules_json) if product is not None else []
+
+    async def add_rule(
+        self,
+        telegram_id: int,
+        product_id: int,
+        kind: ThresholdKind,
+        value: int,
+        *,
+        max_rules: int,
+    ) -> PriceRuleState:
+        async with self._sessions() as session, session.begin():
+            product = await self._owned_product(session, telegram_id, product_id)
+            if product is None:
+                raise RuntimeError("Товар не найден")
+            rules = _load_rules(product.rules_json)
+            if len(rules) >= max_rules:
+                raise ProductLimitError(f"Достигнут лимит: {max_rules} правил")
+            rule = PriceRuleState(
+                id=max((item.id for item in rules), default=0) + 1,
+                kind=kind,
+                value=value,
+                reference_price=product.current_price,
+            )
+            rules.append(rule)
+            product.rules_json = _dump_rules(rules)
+            return rule
+
+    async def delete_rule(self, telegram_id: int, product_id: int, rule_id: int) -> bool:
+        async with self._sessions() as session, session.begin():
+            product = await self._owned_product(session, telegram_id, product_id)
+            if product is None:
+                return False
+            rules = _load_rules(product.rules_json)
+            if len(rules) <= 1:
+                raise RuntimeError("У товара должно остаться хотя бы одно правило")
+            filtered = [item for item in rules if item.id != rule_id]
+            if len(filtered) == len(rules):
+                return False
+            product.rules_json = _dump_rules(filtered)
+            return True
+
+    async def organize_product(
+        self,
+        telegram_id: int,
+        product_id: int,
+        *,
+        folder: str | None,
+        tags: list[str],
+    ) -> bool:
+        async with self._sessions() as session, session.begin():
+            product = await self._owned_product(session, telegram_id, product_id)
+            if product is None:
+                return False
+            product.folder_name = folder[:100] if folder else None
+            product.tags_json = _dump_tags(tags)
+            return True
+
+    async def set_variant(
+        self,
+        telegram_id: int,
+        product_id: int,
+        snapshot: PriceSnapshot,
+    ) -> bool:
+        async with self._sessions() as session, session.begin():
+            product = await self._owned_product(session, telegram_id, product_id)
+            if product is None:
+                return False
+            product.option_id = snapshot.option_id
+            product.size_name = snapshot.size_name
+            product.supplier_id = snapshot.supplier_id
+            product.supplier_name = snapshot.supplier_name
+            product.current_price = snapshot.price
+            product.basic_price = snapshot.basic_price
+            product.is_available = snapshot.available
+            product.quantity = snapshot.quantity
+            product.price_source = "context_reset"
+            rules = _load_rules(product.rules_json)
+            for rule in rules:
+                rule.reference_price = None
+                rule.alert_latched = False
+            product.rules_json = _dump_rules(rules)
+            return True
+
+    async def organization_summary(self, telegram_id: int) -> tuple[dict[str, int], dict[str, int]]:
+        products, _ = await self.list_products(telegram_id, limit=10_000)
+        folders: dict[str, int] = {}
+        tags: dict[str, int] = {}
+        for product in products:
+            if product.folder_name:
+                folders[product.folder_name] = folders.get(product.folder_name, 0) + 1
+            for tag in _load_tags(product.tags_json):
+                tags[tag] = tags.get(tag, 0) + 1
+        return folders, tags
 
     async def get_product(self, telegram_id: int, product_id: int) -> Product | None:
         async with self._sessions() as session:
@@ -290,6 +503,119 @@ class Database:
                 ).all()
             )
 
+    async def history_since(
+        self, telegram_id: int, product_id: int, *, since: datetime
+    ) -> list[PriceHistory]:
+        async with self._sessions() as session:
+            owned = await session.scalar(
+                select(Product.id)
+                .join(User, Product.user_id == User.id)
+                .where(Product.id == product_id, User.telegram_id == telegram_id)
+            )
+            if owned is None:
+                return []
+            return list(
+                (
+                    await session.scalars(
+                        select(PriceHistory)
+                        .where(
+                            PriceHistory.product_id == product_id,
+                            PriceHistory.observed_at >= since,
+                        )
+                        .order_by(PriceHistory.observed_at.asc())
+                    )
+                ).all()
+            )
+
+    async def set_region(self, telegram_id: int, *, destination: int, label: str) -> None:
+        async with self._sessions() as session, session.begin():
+            user = await self._require_user(session, telegram_id)
+            user.wb_destination = destination
+            user.region_label = label[:200]
+            for product in (
+                await session.scalars(select(Product).where(Product.user_id == user.id))
+            ).all():
+                rules = _load_rules(product.rules_json)
+                for rule in rules:
+                    rule.reference_price = None
+                    rule.alert_latched = False
+                product.rules_json = _dump_rules(rules)
+                product.price_source = "context_reset"
+
+    async def set_quiet_hours(
+        self, telegram_id: int, start_minute: int | None, end_minute: int | None
+    ) -> None:
+        async with self._sessions() as session, session.begin():
+            user = await self._require_user(session, telegram_id)
+            user.quiet_start_minute = start_minute
+            user.quiet_end_minute = end_minute
+
+    async def set_digest(
+        self, telegram_id: int, *, enabled: bool, minute: int | None = None
+    ) -> None:
+        async with self._sessions() as session, session.begin():
+            user = await self._require_user(session, telegram_id)
+            user.daily_digest_enabled = enabled
+            if minute is not None:
+                user.daily_digest_minute = minute
+
+    async def notification_preferences(
+        self, allowed_telegram_ids: Set[int]
+    ) -> dict[int, NotificationPreferences]:
+        if not allowed_telegram_ids:
+            return {}
+        async with self._sessions() as session:
+            users = list(
+                (
+                    await session.scalars(
+                        select(User).where(User.telegram_id.in_(allowed_telegram_ids))
+                    )
+                ).all()
+            )
+            return {
+                user.telegram_id: NotificationPreferences(
+                    telegram_id=user.telegram_id,
+                    quiet_start_minute=user.quiet_start_minute,
+                    quiet_end_minute=user.quiet_end_minute,
+                    daily_digest_enabled=user.daily_digest_enabled,
+                    daily_digest_minute=user.daily_digest_minute,
+                    last_digest_date=user.last_digest_date,
+                )
+                for user in users
+            }
+
+    async def mark_digest_sent(self, telegram_id: int, value: date) -> None:
+        async with self._sessions() as session, session.begin():
+            user = await session.scalar(select(User).where(User.telegram_id == telegram_id))
+            if user is not None:
+                user.last_digest_date = value.isoformat()
+
+    async def digest_items(self, telegram_id: int, *, since: datetime) -> list[DigestItem]:
+        products, _ = await self.list_products(telegram_id, limit=10_000)
+        result: list[DigestItem] = []
+        async with self._sessions() as session:
+            for product in products:
+                first_price = await session.scalar(
+                    select(PriceHistory.price)
+                    .where(
+                        PriceHistory.product_id == product.id,
+                        PriceHistory.observed_at >= since,
+                        PriceHistory.price.is_not(None),
+                    )
+                    .order_by(PriceHistory.observed_at.asc())
+                    .limit(1)
+                )
+                result.append(
+                    DigestItem(
+                        title=product.title,
+                        canonical_url=product.canonical_url,
+                        current_price=product.current_price,
+                        first_price=first_price,
+                        is_available=product.is_available,
+                    )
+                )
+        return result
+
     async def save_wb_account(self, telegram_id: int, encrypted_session: str) -> None:
         async with self._sessions() as session, session.begin():
             user = await self._require_user(session, telegram_id)
@@ -313,6 +639,11 @@ class Database:
             for product in products:
                 product.reference_price = None
                 product.alert_latched = False
+                rules = _load_rules(product.rules_json)
+                for rule in rules:
+                    rule.reference_price = None
+                    rule.alert_latched = False
+                product.rules_json = _dump_rules(rules)
                 product.price_source = "context_reset"
 
     async def get_wb_account(self, telegram_id: int) -> WBAccount | None:
@@ -363,7 +694,9 @@ class Database:
             account.last_validated_at = utcnow()
             account.last_error = None
 
-    async def active_targets(self, allowed_telegram_ids: Set[int]) -> list[WatchTarget]:
+    async def active_targets(
+        self, allowed_telegram_ids: Set[int], default_destination: int
+    ) -> list[WatchTarget]:
         if not allowed_telegram_ids:
             return []
         async with self._sessions() as session:
@@ -376,6 +709,11 @@ class Database:
                         Product.nm_id,
                         WBAccount.encrypted_session,
                         WBAccount.status,
+                        User.wb_destination,
+                        Product.option_id,
+                        Product.size_name,
+                        Product.supplier_id,
+                        Product.supplier_name,
                     )
                     .join(User, Product.user_id == User.id)
                     .outerjoin(WBAccount, WBAccount.user_id == User.id)
@@ -387,37 +725,67 @@ class Database:
                     .order_by(Product.user_id, Product.id)
                 )
             ).all()
-            return [WatchTarget(*row) for row in rows]
+            return [
+                WatchTarget(
+                    product_id=row[0],
+                    user_id=row[1],
+                    telegram_id=row[2],
+                    nm_id=row[3],
+                    encrypted_session=row[4],
+                    account_status=row[5],
+                    destination=row[6] if row[6] is not None else default_destination,
+                    option_id=row[7],
+                    size_name=row[8],
+                    supplier_id=row[9],
+                    supplier_name=row[10],
+                )
+                for row in rows
+            ]
 
-    async def apply_snapshot(self, product_id: int, snapshot: PriceSnapshot) -> PendingAlert | None:
+    async def apply_snapshot(self, product_id: int, snapshot: PriceSnapshot) -> list[PendingAlert]:
         async with self._sessions() as session, session.begin():
             product = await session.get(Product, product_id)
             if product is None:
-                return None
+                return []
             telegram_id = await session.scalar(
                 select(User.telegram_id).where(User.id == product.user_id)
             )
             if telegram_id is None:
-                return None
+                return []
 
             previous_price = product.current_price
             previous_availability = product.is_available
             source_changed = product.price_source != snapshot.source
-            decision: AlertDecision | None = None
+            rules = _load_rules(product.rules_json)
+            decisions: list[tuple[PriceRuleState, AlertDecision]] = []
+            restock_created = False
             if source_changed:
-                next_reference = snapshot.price
-                next_latched = False
+                for rule in rules:
+                    rule.reference_price = snapshot.price
+                    rule.alert_latched = False
             else:
-                decision, next_reference, next_latched = evaluate_alert(
-                    threshold_kind=ThresholdKind(product.threshold_kind),
-                    threshold_value=product.threshold_value,
-                    reference_price=product.reference_price,
-                    previous_price=previous_price,
-                    current_price=snapshot.price,
-                    was_available=previous_availability,
-                    is_available=snapshot.available,
-                    alert_latched=product.alert_latched,
-                )
+                for rule in rules:
+                    if not rule.is_active:
+                        continue
+                    decision, next_reference, next_latched = evaluate_alert(
+                        threshold_kind=rule.kind,
+                        threshold_value=rule.value,
+                        reference_price=rule.reference_price,
+                        previous_price=previous_price,
+                        current_price=snapshot.price,
+                        was_available=previous_availability,
+                        is_available=snapshot.available,
+                        alert_latched=rule.alert_latched,
+                    )
+                    rule.reference_price = next_reference
+                    rule.alert_latched = next_latched
+                    if decision is not None:
+                        rule.last_alert_at = snapshot.observed_at
+                        if decision.kind == "back_in_stock":
+                            if restock_created:
+                                continue
+                            restock_created = True
+                        decisions.append((rule, decision))
 
             changed = (
                 previous_price != snapshot.price
@@ -427,7 +795,12 @@ class Database:
             product.title = snapshot.title[:500]
             product.brand = snapshot.brand[:200] if snapshot.brand else None
             product.current_price = snapshot.price if snapshot.price is not None else previous_price
-            product.reference_price = next_reference
+            if rules:
+                product.reference_price = rules[0].reference_price
+                product.alert_latched = rules[0].alert_latched
+                product.threshold_kind = rules[0].kind.value
+                product.threshold_value = rules[0].value
+            product.rules_json = _dump_rules(rules)
             product.lowest_price = _lowest(product.lowest_price, snapshot.price)
             product.basic_price = snapshot.basic_price
             product.is_available = snapshot.available
@@ -436,8 +809,7 @@ class Database:
             product.last_checked_at = snapshot.observed_at
             product.consecutive_errors = 0
             product.last_error = None
-            product.alert_latched = next_latched
-            if decision is not None:
+            if decisions:
                 product.last_alert_at = snapshot.observed_at
             if changed:
                 session.add(
@@ -451,38 +823,45 @@ class Database:
                         observed_at=snapshot.observed_at,
                     )
                 )
-            if decision is None:
-                return None
-            outbox = NotificationOutbox(
-                event_key=(
-                    f"{product.id}:{decision.kind}:{snapshot.observed_at.isoformat()}:"
-                    f"{decision.current_price}"
-                ),
-                telegram_id=int(telegram_id),
-                product_id=product.id,
-                nm_id=product.nm_id,
-                title=product.title,
-                canonical_url=product.canonical_url,
-                source=snapshot.source,
-                kind=decision.kind,
-                reference_price=decision.reference_price,
-                current_price=decision.current_price,
-                drop_amount=decision.drop_amount,
-                drop_basis_points=decision.drop_basis_points,
-                available_at=snapshot.observed_at,
-            )
-            session.add(outbox)
-            await session.flush()
-            return PendingAlert(
-                outbox_id=outbox.id,
-                telegram_id=int(telegram_id),
-                product_id=product.id,
-                nm_id=product.nm_id,
-                title=product.title,
-                canonical_url=product.canonical_url,
-                source=snapshot.source,
-                decision=decision,
-            )
+            alerts: list[PendingAlert] = []
+            for rule, decision in decisions:
+                outbox = NotificationOutbox(
+                    event_key=(
+                        f"{product.id}:{rule.id}:{decision.kind}:"
+                        f"{snapshot.observed_at.isoformat()}:{decision.current_price}"
+                    ),
+                    telegram_id=int(telegram_id),
+                    product_id=product.id,
+                    nm_id=product.nm_id,
+                    title=product.title,
+                    canonical_url=product.canonical_url,
+                    source=snapshot.source,
+                    kind=decision.kind,
+                    rule_kind=rule.kind.value,
+                    rule_value=rule.value,
+                    reference_price=decision.reference_price,
+                    current_price=decision.current_price,
+                    drop_amount=decision.drop_amount,
+                    drop_basis_points=decision.drop_basis_points,
+                    available_at=snapshot.observed_at,
+                )
+                session.add(outbox)
+                await session.flush()
+                alerts.append(
+                    PendingAlert(
+                        outbox_id=outbox.id,
+                        telegram_id=int(telegram_id),
+                        product_id=product.id,
+                        nm_id=product.nm_id,
+                        title=product.title,
+                        canonical_url=product.canonical_url,
+                        source=snapshot.source,
+                        decision=decision,
+                        rule_kind=rule.kind,
+                        rule_value=rule.value,
+                    )
+                )
+            return alerts
 
     async def pending_alerts(self, *, limit: int = 100) -> list[PendingAlert]:
         async with self._sessions() as session:
@@ -516,6 +895,8 @@ class Database:
                         drop_basis_points=row.drop_basis_points,
                     ),
                     attempts=row.attempts,
+                    rule_kind=ThresholdKind(row.rule_kind) if row.rule_kind else None,
+                    rule_value=row.rule_value,
                 )
                 for row in rows
             ]
@@ -626,6 +1007,84 @@ def _lowest(old: int | None, new: int | None) -> int | None:
     if old is None:
         return new
     return min(old, new)
+
+
+def _load_rules(raw: str | None) -> list[PriceRuleState]:
+    try:
+        payload = json.loads(raw or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(payload, list):
+        return []
+    result: list[PriceRuleState] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        try:
+            last_alert = item.get("last_alert_at")
+            result.append(
+                PriceRuleState(
+                    id=int(item["id"]),
+                    kind=ThresholdKind(str(item["kind"])),
+                    value=int(item["value"]),
+                    reference_price=(
+                        int(item["reference_price"])
+                        if item.get("reference_price") is not None
+                        else None
+                    ),
+                    alert_latched=bool(item.get("alert_latched", False)),
+                    is_active=bool(item.get("is_active", True)),
+                    last_alert_at=(datetime.fromisoformat(str(last_alert)) if last_alert else None),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return result
+
+
+def _dump_rules(rules: Sequence[PriceRuleState]) -> str:
+    return json.dumps(
+        [
+            {
+                "id": item.id,
+                "kind": item.kind.value,
+                "value": item.value,
+                "reference_price": item.reference_price,
+                "alert_latched": item.alert_latched,
+                "is_active": item.is_active,
+                "last_alert_at": item.last_alert_at.isoformat() if item.last_alert_at else None,
+            }
+            for item in rules
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _load_tags(raw: str | None) -> list[str]:
+    try:
+        payload = json.loads(raw or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return (
+        [str(item) for item in payload if isinstance(item, str)]
+        if isinstance(payload, list)
+        else []
+    )
+
+
+def _dump_tags(tags: Sequence[str]) -> str:
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in tags:
+        tag = raw.strip().lstrip("#")[:50]
+        key = tag.casefold()
+        if tag and key not in seen:
+            result.append(tag)
+            seen.add(key)
+        if len(result) >= 20:
+            break
+    return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
 
 
 def _sqlite_backup(source: Path, destination: Path) -> None:

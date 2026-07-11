@@ -34,7 +34,7 @@ jobs:
       - name: Validate Compose model
         run: |
           mkdir -p data secrets
-          touch secrets/telegram-token secrets/session-key
+          touch secrets/telegram-token secrets/session-key secrets/mpstats-token
           cp .env.example .env
           docker compose config >/dev/null
       - name: Build image

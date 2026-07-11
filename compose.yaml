@@ -2,7 +2,7 @@ services:
   bot:
     build:
       context: .
-    image: wb-price-bot:${APP_VERSION:-0.1.0}
+    image: wb-price-bot:${APP_VERSION:-0.2.0}
     container_name: wb-price-bot
     restart: unless-stopped
     init: true
@@ -17,6 +17,7 @@ services:
     environment:
       TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram-token
       SESSION_ENCRYPTION_KEY_FILE: /run/secrets/session-key
+      MPSTATS_TOKEN_FILE: /run/secrets/mpstats-token
       DATA_DIR: /data
     volumes:
       - ${WB_DATA_DIR:-./data}:/data

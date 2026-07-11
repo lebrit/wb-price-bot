@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from datetime import timedelta
 from pathlib import Path
 
@@ -15,6 +16,55 @@ from wb_price_bot.database import (
 from wb_price_bot.domain import PriceSnapshot, ThresholdKind, utcnow
 
 from .conftest import make_snapshot
+
+
+@pytest.mark.asyncio
+async def test_initialize_migrates_v010_database_and_is_idempotent(settings: Settings) -> None:
+    with sqlite3.connect(settings.database_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY, telegram_id BIGINT NOT NULL UNIQUE,
+                username VARCHAR(64), display_name VARCHAR(128) NOT NULL,
+                is_admin BOOLEAN NOT NULL, is_enabled BOOLEAN NOT NULL,
+                created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+            );
+            CREATE TABLE products (
+                id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, nm_id BIGINT NOT NULL,
+                title VARCHAR(500) NOT NULL, brand VARCHAR(200), canonical_url VARCHAR(500) NOT NULL,
+                threshold_kind VARCHAR(20) NOT NULL, threshold_value INTEGER NOT NULL,
+                is_active BOOLEAN NOT NULL, is_available BOOLEAN NOT NULL,
+                alert_latched BOOLEAN NOT NULL, current_price INTEGER, reference_price INTEGER,
+                lowest_price INTEGER, basic_price INTEGER, price_source VARCHAR(32) NOT NULL,
+                quantity INTEGER NOT NULL, consecutive_errors INTEGER NOT NULL,
+                last_error VARCHAR(500), last_checked_at DATETIME, last_alert_at DATETIME,
+                created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            INSERT INTO users VALUES
+                (1, 1001, 'owner', 'Owner', 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+            INSERT INTO products VALUES
+                (1, 1, 28436956, 'Legacy', 'WB', 'https://www.wildberries.ru/catalog/28436956/detail.aspx',
+                 'percent', 1000, 1, 1, 0, 100000, 100000, 100000, 150000,
+                 'public_api', 5, 0, NULL, CURRENT_TIMESTAMP, NULL,
+                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+            """
+        )
+
+    database = Database(settings.database_path)
+    await database.initialize()
+    await database.initialize()
+    product = await database.get_product(1001, 1)
+    rules = await database.product_rules(1001, 1)
+
+    assert product is not None
+    assert product.rules_json != "[]"
+    assert product.tags_json == "[]"
+    assert len(rules) == 1
+    assert rules[0].kind is ThresholdKind.PERCENT
+    assert rules[0].value == 1000
+    assert rules[0].reference_price == 100_000
+    await database.close()
 
 
 @pytest.mark.asyncio
@@ -39,9 +89,10 @@ async def test_database_product_lifecycle_and_alerts(settings: Settings) -> None
         )
 
     no_alert = await database.apply_snapshot(product.id, make_snapshot(price=95_000))
-    assert no_alert is None
-    alert = await database.apply_snapshot(product.id, make_snapshot(price=89_000))
-    assert alert is not None
+    assert no_alert == []
+    alerts = await database.apply_snapshot(product.id, make_snapshot(price=89_000))
+    assert len(alerts) == 1
+    alert = alerts[0]
     assert alert.decision.kind == "price_drop"
     assert alert.decision.reference_price == 100_000
 
@@ -53,7 +104,7 @@ async def test_database_product_lifecycle_and_alerts(settings: Settings) -> None
     source_change = await database.apply_snapshot(
         product.id, make_snapshot(price=80_000, source="account_browser")
     )
-    assert source_change is None
+    assert source_change == []
     updated = await database.get_product(1001, product.id)
     assert updated is not None
     assert updated.reference_price == 80_000
@@ -79,7 +130,7 @@ async def test_out_of_stock_never_overwrites_known_price(settings: Settings) -> 
         max_products=20,
     )
     snapshot = make_snapshot(price=None, available=False, quantity=0)
-    assert await database.apply_snapshot(product.id, snapshot) is None
+    assert await database.apply_snapshot(product.id, snapshot) == []
     updated = await database.get_product(1001, product.id)
     assert updated is not None
     assert updated.current_price == 100_000
@@ -140,8 +191,9 @@ async def test_alert_is_persisted_until_marked_sent(settings: Settings) -> None:
         max_products=20,
     )
 
-    alert = await database.apply_snapshot(product.id, make_snapshot(price=90_000))
-    assert alert is not None
+    alerts = await database.apply_snapshot(product.id, make_snapshot(price=90_000))
+    assert len(alerts) == 1
+    alert = alerts[0]
     pending = await database.pending_alerts()
     assert [item.outbox_id for item in pending] == [alert.outbox_id]
     assert (await database.stats()).alerts_pending == 1
@@ -164,7 +216,7 @@ async def test_deleting_product_discards_pending_alert(settings: Settings) -> No
         threshold_value=5000,
         max_products=20,
     )
-    assert await database.apply_snapshot(product.id, make_snapshot(price=90_000)) is not None
+    assert await database.apply_snapshot(product.id, make_snapshot(price=90_000))
     assert (await database.stats()).alerts_pending == 1
 
     assert await database.delete_product(1001, product.id) is True
@@ -210,8 +262,64 @@ async def test_active_targets_respect_current_allowlist(settings: Settings) -> N
             max_products=20,
         )
 
-    targets = await database.active_targets({1002})
+    targets = await database.active_targets({1002}, settings.wb_destination)
     assert [item.telegram_id for item in targets] == [1002]
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_multiple_rules_create_independent_alerts(settings: Settings) -> None:
+    database = Database(settings.database_path)
+    await database.initialize()
+    await database.ensure_user(1001, None, "Owner", is_admin=True)
+    product = await database.add_product(
+        telegram_id=1001,
+        snapshot=make_snapshot(price=100_000),
+        threshold_kind=ThresholdKind.PERCENT,
+        threshold_value=1000,
+        max_products=20,
+    )
+    await database.add_rule(1001, product.id, ThresholdKind.AMOUNT, 5000, max_rules=10)
+
+    alerts = await database.apply_snapshot(product.id, make_snapshot(price=90_000))
+    assert len(alerts) == 2
+    assert {item.rule_kind for item in alerts} == {
+        ThresholdKind.PERCENT,
+        ThresholdKind.AMOUNT,
+    }
+    assert len(await database.pending_alerts()) == 2
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_region_preferences_and_organization_are_persisted(settings: Settings) -> None:
+    database = Database(settings.database_path)
+    await database.initialize()
+    await database.ensure_user(1001, None, "Owner", is_admin=True)
+    product = await database.add_product(
+        telegram_id=1001,
+        snapshot=make_snapshot(price=100_000),
+        threshold_kind=ThresholdKind.TARGET,
+        threshold_value=80_000,
+        max_products=20,
+    )
+    await database.set_region(1001, destination=-123, label="Test region")
+    await database.set_quiet_hours(1001, 1320, 480)
+    await database.set_digest(1001, enabled=True, minute=600)
+    await database.organize_product(
+        1001, product.id, folder="Подарки", tags=["Дом", "скидки", "дом"]
+    )
+
+    user = await database.get_user(1001)
+    updated = await database.get_product(1001, product.id)
+    preferences = await database.notification_preferences({1001})
+    assert user is not None and user.wb_destination == -123
+    assert updated is not None and updated.price_source == "context_reset"
+    assert updated.folder_name == "Подарки"
+    assert updated.tags_json == '["Дом","скидки"]'
+    assert (await database.product_rules(1001, product.id))[0].reference_price is None
+    assert preferences[1001].quiet_start_minute == 1320
+    assert preferences[1001].daily_digest_enabled is True
     await database.close()
 
 

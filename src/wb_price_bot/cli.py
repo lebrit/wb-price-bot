@@ -17,7 +17,7 @@ from .config import ConfigurationError, Settings
 from .database import Database, normalize_datetime
 from .domain import format_money, utcnow
 from .security import SessionCipher, SessionFormatError, normalize_wb_session
-from .wildberries import PublicWildberriesClient, WildberriesError
+from .wildberries import MpstatsPriceClient, PublicWildberriesClient, WildberriesError
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -43,6 +43,10 @@ def _parser() -> argparse.ArgumentParser:
 
     check_wb = subparsers.add_parser("check-wb", help="Проверить публичную карточку WB")
     check_wb.add_argument("reference", help="Ссылка или артикул")
+    check_mpstats = subparsers.add_parser(
+        "check-mpstats", help="Проверить лицензированный fallback MPSTATS"
+    )
+    check_mpstats.add_argument("nm_id", type=int, nargs="?", default=28436956)
     return parser
 
 
@@ -162,6 +166,30 @@ async def _run_command(args: argparse.Namespace, settings: Settings) -> int:
                         "price": format_money(snapshot.price),
                         "available": snapshot.available,
                         "quantity": snapshot.quantity,
+                        "source": snapshot.source,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+
+        if args.command == "check-mpstats":
+            mpstats_client = MpstatsPriceClient(settings)
+            try:
+                result = await mpstats_client.fetch_many([args.nm_id])
+            finally:
+                await mpstats_client.close()
+            snapshot = result.products.get(args.nm_id)
+            if snapshot is None:
+                raise RuntimeError(result.errors.get(args.nm_id, "MPSTATS не вернул товар"))
+            print(
+                json.dumps(
+                    {
+                        "nm_id": snapshot.nm_id,
+                        "title": snapshot.title,
+                        "price": format_money(snapshot.price),
+                        "available": snapshot.available,
                         "source": snapshot.source,
                     },
                     ensure_ascii=False,

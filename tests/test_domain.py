@@ -1,3 +1,4 @@
+from datetime import time
 from decimal import Decimal
 
 import pytest
@@ -7,7 +8,10 @@ from wb_price_bot.domain import (
     calculate_drop_basis_points,
     evaluate_alert,
     extract_nm_id,
+    format_clock,
     format_money,
+    is_quiet_time,
+    parse_clock,
     parse_user_number,
     percent_to_basis_points,
     rubles_to_kopecks,
@@ -195,3 +199,13 @@ def test_back_in_stock_alerts_even_when_initial_price_was_missing() -> None:
     )
     assert decision is not None and decision.kind == "back_in_stock"
     assert reference == 99_000
+
+
+def test_quiet_hours_support_overnight_window() -> None:
+    assert parse_clock("22:30") == 1350
+    assert format_clock(1350) == "22:30"
+    assert is_quiet_time(1320, 480, time(23, 0)) is True
+    assert is_quiet_time(1320, 480, time(7, 59)) is True
+    assert is_quiet_time(1320, 480, time(12, 0)) is False
+    with pytest.raises(ValueError):
+        parse_clock("25:00")

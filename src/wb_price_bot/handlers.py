@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import html
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
@@ -17,11 +18,13 @@ from .database import Database, ProductAlreadyExistsError, ProductLimitError
 from .domain import (
     PriceSnapshot,
     ThresholdKind,
+    VariantSelection,
     format_money,
     parse_user_number,
     percent_to_basis_points,
     rubles_to_kopecks,
 )
+from .features import register_feature_handlers
 from .keyboards import (
     account_delete_confirmation,
     account_keyboard,
@@ -31,13 +34,17 @@ from .keyboards import (
     product_keyboard,
     products_keyboard,
     threshold_keyboard,
+    variant_keyboard,
 )
 from .monitor import PriceMonitor, seconds_since, source_label
 from .security import SessionCipher
 from .wildberries import (
     AccountSessionError,
     AccountWildberriesClient,
+    FetchResult,
+    MpstatsPriceClient,
     ProductReferenceError,
+    ProductVariant,
     PublicWildberriesClient,
     WildberriesError,
 )
@@ -51,12 +58,14 @@ class HandlerContext:
     database: Database
     public_client: PublicWildberriesClient
     account_client: AccountWildberriesClient
+    licensed_client: MpstatsPriceClient
     cipher: SessionCipher
     monitor: PriceMonitor
 
 
 class AddProductStates(StatesGroup):
     waiting_reference = State()
+    waiting_variant = State()
     waiting_kind = State()
     waiting_value = State()
 
@@ -141,17 +150,76 @@ def create_router(context: HandlerContext) -> Router:
         wait_message = await message.answer("Проверяю карточку и текущую цену…")
         try:
             nm_id = await context.public_client.resolve_reference(message.text)
-            snapshot = await _fetch_for_user(context, message.from_user.id, nm_id)
+            result = await _fetch_catalog_for_user(context, message.from_user.id, nm_id)
+            snapshot = result.products.get(nm_id)
+            if snapshot is None:
+                raise WildberriesError(result.errors.get(nm_id, "Товар не найден"))
         except (ProductReferenceError, WildberriesError, AccountSessionError, ValueError) as exc:
             await wait_message.edit_text(f"Не удалось получить товар: {html.escape(str(exc))}")
             return
-        await state.update_data(snapshot=_snapshot_to_state(snapshot))
+        variants = result.variants.get(nm_id, [])
+        minimum_snapshot = replace(snapshot, option_id=None, size_name=None)
+        await state.update_data(
+            snapshot=_snapshot_to_state(minimum_snapshot),
+            variants=[_variant_to_state(item, snapshot.source) for item in variants],
+        )
+        if variants:
+            await state.set_state(AddProductStates.waiting_variant)
+            seller = variants[0].supplier_name or "не указан"
+            await wait_message.edit_text(
+                _snapshot_preview(minimum_snapshot)
+                + f"\nПродавец закреплён: <b>{html.escape(seller)}</b>.\n\n"
+                "Выберите конкретный размер:",
+                reply_markup=variant_keyboard(
+                    [
+                        (item.option_id, item.size_name, item.price, item.available)
+                        for item in variants
+                    ]
+                ),
+            )
+            return
         await state.set_state(AddProductStates.waiting_kind)
         await wait_message.edit_text(
             _snapshot_preview(snapshot) + "\n\nКакое условие уведомления установить?\n"
             "Процент и сумма считаются от максимальной цены после добавления или прошлого сигнала.",
             reply_markup=threshold_keyboard(),
         )
+
+    @router.callback_query(AddProductStates.waiting_variant, F.data.startswith("addvariant:"))
+    async def choose_variant(callback: CallbackQuery, state: FSMContext) -> None:
+        try:
+            option_id = int(str(callback.data).split(":", 1)[1])
+        except (ValueError, IndexError):
+            await callback.answer("Некорректный размер", show_alert=True)
+            return
+        data = await state.get_data()
+        if option_id == 0:
+            snapshot = _snapshot_from_state(data["snapshot"])
+            await state.set_state(AddProductStates.waiting_kind)
+            if isinstance(callback.message, Message):
+                await callback.message.edit_text(
+                    _snapshot_preview(snapshot) + "\nРежим: <b>минимальная доступная цена</b>.\n\n"
+                    "Какое условие уведомления установить?",
+                    reply_markup=threshold_keyboard(),
+                )
+            await callback.answer()
+            return
+        variants = data.get("variants", [])
+        selected = next(
+            (item for item in variants if int(item.get("option_id", 0)) == option_id), None
+        )
+        if not isinstance(selected, dict):
+            await callback.answer("Размер больше не доступен", show_alert=True)
+            return
+        snapshot = _snapshot_from_state(selected["snapshot"])
+        await state.update_data(snapshot=_snapshot_to_state(snapshot))
+        await state.set_state(AddProductStates.waiting_kind)
+        if isinstance(callback.message, Message):
+            await callback.message.edit_text(
+                _snapshot_preview(snapshot) + "\n\nКакое условие уведомления установить?",
+                reply_markup=threshold_keyboard(),
+            )
+        await callback.answer()
 
     @router.callback_query(AddProductStates.waiting_kind, F.data.startswith("addkind:"))
     async def choose_threshold(callback: CallbackQuery, state: FSMContext) -> None:
@@ -191,6 +259,12 @@ def create_router(context: HandlerContext) -> Router:
                 threshold_kind=kind,
                 threshold_value=value,
                 max_products=context.settings.max_products_per_user,
+                selection=VariantSelection(
+                    option_id=snapshot.option_id,
+                    size_name=snapshot.size_name,
+                    supplier_id=snapshot.supplier_id,
+                    supplier_name=snapshot.supplier_name,
+                ),
             )
         except (ValueError, KeyError, TypeError) as exc:
             await message.answer(html.escape(str(exc)))
@@ -478,6 +552,10 @@ def create_router(context: HandlerContext) -> Router:
             "/add — добавить товар\n"
             "/list — список товаров\n"
             "/account — аккаунт Wildberries\n"
+            "/settings — регион, тихие часы и сводка\n"
+            "/import — массовый импорт ссылок\n"
+            "/export — экспорт CSV/JSON\n"
+            "/folders — папки и теги\n"
             "/status — состояние сервиса\n"
             "/cancel — отменить текущий ввод\n\n"
             "Бот уведомляет о суммарном падении от контрольной цены. После уведомления "
@@ -486,6 +564,8 @@ def create_router(context: HandlerContext) -> Router:
 
     router.message.register(help_message, Command("help"))
     router.message.register(help_message, F.text == "❓ Помощь")
+
+    register_feature_handlers(router, context)
 
     @router.message(StateFilter(None))
     async def unknown(message: Message) -> None:
@@ -496,36 +576,21 @@ def create_router(context: HandlerContext) -> Router:
     return router
 
 
-async def _fetch_for_user(context: HandlerContext, telegram_id: int, nm_id: int) -> PriceSnapshot:
-    account = await context.database.get_wb_account(telegram_id)
-    if account is None:
-        result = await context.public_client.fetch_many([nm_id])
-    else:
-        if account.status != "active":
-            raise AccountSessionError(
-                "Подключённая WB-сессия требует обновления. Бот не подменяет её публичной ценой."
-            )
-        user = await context.database.get_user(telegram_id)
-        try:
-            state = context.cipher.decrypt(account.encrypted_session)
-            result = await context.account_client.fetch_many([nm_id], state)
-        except (AccountSessionError, ValueError) as exc:
-            if user is not None:
-                await context.database.set_account_result(user.id, success=False, error=str(exc))
+async def _fetch_catalog_for_user(
+    context: HandlerContext, telegram_id: int, nm_id: int
+) -> FetchResult:
+    user = await context.database.get_user(telegram_id)
+    destination = (
+        user.wb_destination
+        if user is not None and user.wb_destination is not None
+        else context.settings.wb_destination
+    )
+    try:
+        return await context.public_client.fetch_many([nm_id], destination=destination)
+    except WildberriesError:
+        if not context.licensed_client.enabled:
             raise
-        if user is not None and result.refreshed_session:
-            await context.database.refresh_wb_account_session(
-                user.id, context.cipher.encrypt(result.refreshed_session)
-            )
-        elif user is not None:
-            await context.database.set_account_result(user.id, success=True)
-    snapshot = result.products.get(nm_id)
-    if snapshot is None:
-        product_error = result.errors.get(nm_id)
-        if product_error:
-            raise WildberriesError(product_error)
-        raise WildberriesError("Товар не найден или карточка недоступна")
-    return snapshot
+        return await context.licensed_client.fetch_many([nm_id])
 
 
 def _snapshot_to_state(snapshot: PriceSnapshot) -> dict[str, Any]:
@@ -539,6 +604,10 @@ def _snapshot_to_state(snapshot: PriceSnapshot) -> dict[str, Any]:
         "quantity": snapshot.quantity,
         "source": snapshot.source,
         "observed_at": snapshot.observed_at.isoformat(),
+        "option_id": snapshot.option_id,
+        "size_name": snapshot.size_name,
+        "supplier_id": snapshot.supplier_id,
+        "supplier_name": snapshot.supplier_name,
     }
 
 
@@ -553,7 +622,16 @@ def _snapshot_from_state(data: dict[str, Any]) -> PriceSnapshot:
         quantity=int(data["quantity"]),
         source=str(data["source"]),
         observed_at=datetime.fromisoformat(str(data["observed_at"])),
+        option_id=int(data["option_id"]) if data.get("option_id") is not None else None,
+        size_name=str(data["size_name"]) if data.get("size_name") else None,
+        supplier_id=(int(data["supplier_id"]) if data.get("supplier_id") is not None else None),
+        supplier_name=str(data["supplier_name"]) if data.get("supplier_name") else None,
     )
+
+
+def _variant_to_state(variant: ProductVariant, source: str) -> dict[str, Any]:
+    snapshot = variant.snapshot(source)
+    return {"option_id": variant.option_id, "snapshot": _snapshot_to_state(snapshot)}
 
 
 def _snapshot_preview(snapshot: PriceSnapshot) -> str:
@@ -585,14 +663,38 @@ def _product_text(product: Any) -> str:
         else "ещё не проверялся"
     )
     error = f"\nОшибка: {html.escape(product.last_error)}" if product.last_error else ""
+    try:
+        rules = json.loads(product.rules_json or "[]")
+        tags = json.loads(product.tags_json or "[]")
+    except json.JSONDecodeError:
+        rules, tags = [], []
+    rule_text = "; ".join(
+        _threshold_label(str(item.get("kind")), int(item.get("value", 0)))
+        for item in rules
+        if isinstance(item, dict)
+    ) or _threshold_label(product.threshold_kind, product.threshold_value)
+    variant = ""
+    if product.size_name:
+        variant += f"Размер: <b>{html.escape(product.size_name)}</b>\n"
+    else:
+        variant += "Размер: <b>минимальная доступная цена</b>\n"
+    if product.supplier_name:
+        variant += f"Продавец: <b>{html.escape(product.supplier_name)}</b>\n"
+    organization = ""
+    if product.folder_name:
+        organization += f"Папка: {html.escape(product.folder_name)}\n"
+    if tags:
+        organization += "Теги: " + " ".join(f"#{html.escape(str(tag))}" for tag in tags) + "\n"
     return (
         f'<a href="{html.escape(product.canonical_url, quote=True)}">'
         f"<b>{html.escape(product.title)}</b></a>\n\n"
         f"Артикул: <code>{product.nm_id}</code>\n"
+        f"{variant}"
         f"Цена: <b>{format_money(product.current_price)}</b>\n"
         f"Минимум: {format_money(product.lowest_price)}\n"
         f"Наличие: {available}\n"
-        f"Условие: {_threshold_label(product.threshold_kind, product.threshold_value)}\n"
+        f"Правила: {rule_text}\n"
+        f"{organization}"
         f"Источник: {source_label(product.price_source)}\n"
         f"Мониторинг: {active}\n"
         f"Проверено: {checked}{error}"

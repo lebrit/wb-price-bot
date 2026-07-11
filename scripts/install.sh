@@ -269,6 +269,10 @@ WB_LANGUAGE=ru
 PRICE_HISTORY_DAYS=180
 LOG_LEVEL=INFO
 WB_BROWSER_HEADLESS=false
+APP_TIMEZONE=Asia/Irkutsk
+MAX_BULK_IMPORT=50
+MAX_RULES_PER_PRODUCT=10
+MPSTATS_MAX_AGE_HOURS=24
 EOF
   chown root:10001 "${tmp}"
   chmod 640 "${tmp}"
@@ -311,6 +315,11 @@ create_session_key() {
   fi
   chown root:10001 "${SECRETS_DIR}/session-key"
   chmod 640 "${SECRETS_DIR}/session-key"
+  if [[ ! -e "${SECRETS_DIR}/mpstats-token" ]]; then
+    : >"${SECRETS_DIR}/mpstats-token"
+  fi
+  chown root:10001 "${SECRETS_DIR}/mpstats-token"
+  chmod 640 "${SECRETS_DIR}/mpstats-token"
 }
 
 configure_first_install() {
@@ -499,6 +508,8 @@ command_update() {
   ensure_base_tools
   ensure_docker
   [[ -f "${CURRENT_LINK}/VERSION" ]] || die "сначала установите приложение"
+  prepare_directories
+  create_session_key
   local source release
   create_backup || die "не удалось создать резервную копию перед обновлением"
   source="$(mktemp -d)"
@@ -604,6 +615,54 @@ wb_session_menu() {
       4)
         read_prompt reference "Ссылка или артикул" "28436956"
         compose_current run --rm -T bot python -m wb_price_bot check-wb "${reference}"
+        ;;
+      0) return ;;
+      *) warn "неизвестный пункт" ;;
+    esac
+  done
+}
+
+licensed_provider_menu() {
+  local choice token old
+  while true; do
+    say
+    say "Лицензированный источник MPSTATS"
+    say "Статус: $([[ -s "${SECRETS_DIR}/mpstats-token" ]] && echo настроен || echo выключен)"
+    say "1) Добавить или заменить API token"
+    say "2) Проверить подключение"
+    say "3) Удалить token и выключить fallback"
+    say "0) Назад"
+    read_prompt choice "Выберите пункт"
+    case "${choice}" in
+      1)
+        read_secret token "MPSTATS API token"
+        [[ -n "${token}" && "${token}" != *$'\n'* ]] || { warn "пустой или неверный token"; continue; }
+        old="$(<"${SECRETS_DIR}/mpstats-token")"
+        printf '%s\n' "${token}" >"${SECRETS_DIR}/.mpstats-token.tmp"
+        chown root:10001 "${SECRETS_DIR}/.mpstats-token.tmp"
+        chmod 640 "${SECRETS_DIR}/.mpstats-token.tmp"
+        mv -f "${SECRETS_DIR}/.mpstats-token.tmp" "${SECRETS_DIR}/mpstats-token"
+        if ! compose_current run --rm -T bot python -m wb_price_bot check-mpstats 28436956; then
+          warn "MPSTATS отклонил token, возвращаю предыдущее значение"
+          printf '%s' "${old}" >"${SECRETS_DIR}/mpstats-token"
+          chown root:10001 "${SECRETS_DIR}/mpstats-token"
+          chmod 640 "${SECRETS_DIR}/mpstats-token"
+          continue
+        fi
+        compose_current restart bot
+        say "MPSTATS fallback включён."
+        ;;
+      2)
+        [[ -s "${SECRETS_DIR}/mpstats-token" ]] || { warn "token не настроен"; continue; }
+        compose_current run --rm -T bot python -m wb_price_bot check-mpstats 28436956
+        ;;
+      3)
+        confirm_phrase DELETE-MPSTATS "Удалить MPSTATS token" || { say "Отменено."; continue; }
+        : >"${SECRETS_DIR}/mpstats-token"
+        chown root:10001 "${SECRETS_DIR}/mpstats-token"
+        chmod 640 "${SECRETS_DIR}/mpstats-token"
+        compose_current restart bot
+        say "MPSTATS fallback выключен."
         ;;
       0) return ;;
       *) warn "неизвестный пункт" ;;
@@ -731,7 +790,11 @@ doctor() {
   say "Свободное место:"
   df -h "${DATA_DIR}" | tail -n 1
   say "Права секретов:"
-  stat -c '%a %U:%G %n' "${SECRETS_DIR}/telegram-token" "${SECRETS_DIR}/session-key"
+  stat -c '%a %U:%G %n' \
+    "${SECRETS_DIR}/telegram-token" \
+    "${SECRETS_DIR}/session-key" \
+    "${SECRETS_DIR}/mpstats-token"
+  say "MPSTATS fallback: $([[ -s "${SECRETS_DIR}/mpstats-token" ]] && echo настроен || echo выключен)"
   say "Контейнер:"
   docker inspect --format 'status={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${CONTAINER_NAME}" 2>/dev/null || true
   compose_current run --rm -T bot python -m wb_price_bot integrity-check
@@ -769,7 +832,7 @@ uninstall_menu() {
       exit 0
       ;;
     2)
-      warn "Telegram-токен не отзывается автоматически, а WB-сессия удаляется только локально."
+      warn "Telegram/MPSTATS token не отзываются автоматически, а WB-сессия удаляется только локально."
       confirm_phrase DELETE-WB-BOT "Полностью удалить WB Price Bot" || { say "Отменено."; return; }
       if ! compose_current down --remove-orphans --rmi all; then
         warn "не удалось остановить контейнеры; полное удаление отменено"
@@ -833,9 +896,10 @@ command_menu() {
     say "7) Настройки Telegram"
     say "8) Аккаунт Wildberries"
     say "9) Настройки мониторинга"
-    say "10) Резервные копии"
-    say "11) Диагностика"
-    say "12) Удаление"
+    say "10) Лицензированный источник MPSTATS"
+    say "11) Резервные копии"
+    say "12) Диагностика"
+    say "13) Удаление"
     say "0) Выход"
     read_prompt choice "Выберите пункт"
     case "${choice}" in
@@ -848,9 +912,10 @@ command_menu() {
       7) telegram_menu ;;
       8) wb_session_menu ;;
       9) monitoring_menu ;;
-      10) backup_menu ;;
-      11) doctor ;;
-      12) uninstall_menu ;;
+      10) licensed_provider_menu ;;
+      11) backup_menu ;;
+      12) doctor ;;
+      13) uninstall_menu ;;
       0) return ;;
       *) warn "неизвестный пункт" ;;
     esac
