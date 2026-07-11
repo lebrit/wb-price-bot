@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import html
 import json
 from dataclasses import dataclass, replace
@@ -26,6 +27,8 @@ from .domain import (
 )
 from .features import register_feature_handlers
 from .keyboards import (
+    access_review_keyboard,
+    account_auth_keyboard,
     account_delete_confirmation,
     account_keyboard,
     account_warning_keyboard,
@@ -71,8 +74,9 @@ class AddProductStates(StatesGroup):
 
 
 class AccessMiddleware(BaseMiddleware):
-    def __init__(self, allowed_users: frozenset[int]) -> None:
-        self._allowed_users = allowed_users
+    def __init__(self, settings: Settings, database: Database) -> None:
+        self._settings = settings
+        self._database = database
 
     async def __call__(
         self,
@@ -81,18 +85,50 @@ class AccessMiddleware(BaseMiddleware):
         data: dict[str, Any],
     ) -> Any:
         user = getattr(event, "from_user", None)
-        if user is None or user.id not in self._allowed_users:
-            if isinstance(event, CallbackQuery):
-                await event.answer("Доступ к боту закрыт", show_alert=True)
-            elif isinstance(event, Message):
-                await event.answer("⛔ Этот бот работает только для разрешённых Telegram ID.")
+        if user is None:
             return None
-        return await handler(event, data)
+        stored = await self._database.get_user(user.id)
+        if user.id in self._settings.allowed_users:
+            if (
+                stored is None
+                or not stored.is_admin
+                or stored.access_status != "approved"
+                or not stored.is_enabled
+            ):
+                await self._database.ensure_user(
+                    user.id,
+                    user.username,
+                    user.full_name,
+                    is_admin=True,
+                )
+            return await handler(event, data)
+        if (
+            self._settings.registration_mode != "allowlist"
+            and stored is not None
+            and stored.access_status == "approved"
+            and stored.is_enabled
+        ):
+            return await handler(event, data)
+        command = (event.text or "").split(maxsplit=1) if isinstance(event, Message) else []
+        is_start = bool(command) and command[0].split("@", 1)[0] == "/start"
+        if is_start and self._settings.registration_mode != "allowlist":
+            return await handler(event, data)
+        status = stored.access_status if stored is not None else "unknown"
+        message = (
+            "⏳ Заявка на доступ ожидает решения администратора."
+            if status == "pending"
+            else "⛔ Доступ к боту не разрешён."
+        )
+        if isinstance(event, CallbackQuery):
+            await event.answer(message, show_alert=True)
+        elif isinstance(event, Message):
+            await event.answer(message)
+        return None
 
 
 def create_router(context: HandlerContext) -> Router:
     router = Router(name="main")
-    access = AccessMiddleware(context.settings.allowed_users)
+    access = AccessMiddleware(context.settings, context.database)
     router.message.middleware(access)
     router.callback_query.middleware(access)
 
@@ -101,12 +137,44 @@ def create_router(context: HandlerContext) -> Router:
         await state.clear()
         user = message.from_user
         assert user is not None
-        await context.database.ensure_user(
+        is_admin = user.id in context.settings.allowed_users
+        existing = await context.database.get_user(user.id)
+        auto_approve = is_admin or context.settings.registration_mode == "open"
+        registered = await context.database.ensure_user(
             user.id,
             user.username,
             user.full_name,
-            is_admin=user.id in context.settings.allowed_users,
+            is_admin=is_admin,
+            auto_approve=auto_approve,
         )
+        if registered.access_status != "approved":
+            if registered.access_status == "blocked":
+                await message.answer("⛔ Администратор отклонил доступ к этому боту.")
+                return
+            await message.answer(
+                "⏳ <b>Заявка отправлена</b>\n\n"
+                "Администратор получит уведомление и сможет разрешить доступ."
+            )
+            if existing is None:
+                identity = (
+                    f"@{html.escape(user.username)}"
+                    if user.username
+                    else html.escape(user.full_name)
+                )
+                for admin_id in context.settings.allowed_users:
+                    try:
+                        if message.bot is None:
+                            break
+                        await message.bot.send_message(
+                            admin_id,
+                            "👤 <b>Новая заявка на доступ</b>\n\n"
+                            f"Пользователь: {identity}\n"
+                            f"Telegram ID: <code>{user.id}</code>",
+                            reply_markup=access_review_keyboard(user.id),
+                        )
+                    except Exception:
+                        pass
+            return
         await message.answer(
             "👋 <b>WB Price Bot готов.</b>\n\n"
             "Добавьте ссылку Wildberries, выберите условие — процент, сумму падения "
@@ -115,6 +183,80 @@ def create_router(context: HandlerContext) -> Router:
             "Источник всегда указан в карточке и уведомлении.",
             reply_markup=main_keyboard(),
         )
+
+    @router.callback_query(F.data.startswith("access:"))
+    async def review_access(callback: CallbackQuery) -> None:
+        if callback.from_user.id not in context.settings.allowed_users:
+            await callback.answer("Только для администратора", show_alert=True)
+            return
+        try:
+            _, action, raw_id = str(callback.data).split(":", 2)
+            target_id = int(raw_id)
+            approve = action == "approve"
+            if action not in {"approve", "block"}:
+                raise ValueError
+            reviewed = await context.database.review_user_access(
+                callback.from_user.id,
+                target_id,
+                approve=approve,
+                configured_admins=context.settings.allowed_users,
+            )
+        except (ValueError, PermissionError):
+            await callback.answer("Не удалось изменить доступ", show_alert=True)
+            return
+        if reviewed is None:
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+        await callback.answer("Доступ разрешён" if approve else "Доступ отклонён")
+        if isinstance(callback.message, Message):
+            await callback.message.edit_reply_markup(reply_markup=None)
+        if callback.bot is not None:
+            with contextlib.suppress(Exception):
+                await callback.bot.send_message(
+                    target_id,
+                    "✅ Доступ к WB Price Bot разрешён. Отправьте /start."
+                    if approve
+                    else "⛔ Администратор отклонил заявку на доступ.",
+                )
+
+    @router.message(Command("users"))
+    async def show_users(message: Message) -> None:
+        if message.from_user is None:
+            return
+        if message.from_user.id not in context.settings.allowed_users:
+            await message.answer("Команда доступна администратору.")
+            return
+        requested = (message.text or "").partition(" ")[2].strip().lower() or "pending"
+        aliases = {
+            "pending": "pending",
+            "new": "pending",
+            "approved": "approved",
+            "active": "approved",
+            "blocked": "blocked",
+        }
+        status = aliases.get(requested)
+        if status is None:
+            await message.answer("Использование: <code>/users pending|approved|blocked</code>")
+            return
+        users = await context.database.users_by_access_status(status, limit=50)
+        if not users:
+            await message.answer(f"👥 Пользователей со статусом {status} нет.")
+            return
+        await message.answer(
+            f"👥 Статус <b>{status}</b>: {len(users)}\n"
+            "Фильтры: <code>/users pending</code>, <code>/users approved</code>, "
+            "<code>/users blocked</code>"
+        )
+        for item in users:
+            identity = (
+                f"@{html.escape(item.username)}"
+                if item.username
+                else html.escape(item.display_name)
+            )
+            await message.answer(
+                f"{identity}\nTelegram ID: <code>{item.telegram_id}</code>",
+                reply_markup=access_review_keyboard(item.telegram_id),
+            )
 
     @router.message(Command("cancel"))
     async def cancel_command(message: Message, state: FSMContext) -> None:
@@ -479,12 +621,27 @@ def create_router(context: HandlerContext) -> Router:
         ):
             await callback.answer("Подключение доступно только в личном чате", show_alert=True)
             return
+        if not context.settings.auth_enabled:
+            await callback.message.edit_text(
+                "Web-авторизация не настроена на сервере. Укажите домен через "
+                "<code>sudo wb-price-bot</code> → «Web-авторизация».",
+                reply_markup=account_keyboard(
+                    await context.database.get_wb_account(callback.from_user.id) is not None
+                ),
+            )
+            await callback.answer()
+            return
+        auth_session = await context.database.create_auth_session(
+            callback.from_user.id, context.settings.auth_session_ttl_seconds
+        )
+        url = f"{context.settings.auth_public_url}/login/{auth_session.id}"
+        ttl_minutes = context.settings.auth_session_ttl_seconds // 60
         await callback.message.edit_text(
-            "Запустите на компьютере <code>scripts/capture_wb_session.py</code>, войдите в WB "
-            "в открывшемся браузере и получите <code>wb-session.json</code>.\n\n"
-            "Сессию нельзя отправлять в Telegram. Передайте её прямо своему серверу по SSH:\n"
-            f'<code>ssh USER@SERVER "sudo wb-price-bot wb-session-import {callback.from_user.id}" &lt; wb-session.json</code>\n\n'
-            "Либо перенесите файл по SCP и импортируйте через серверное меню, затем удалите файл."
+            "🔐 <b>Защищённое окно готово</b>\n\n"
+            f"Оно действует {ttl_minutes} мин. и привязано к вашему Telegram ID. Войдите в Wildberries, "
+            "затем нажмите внутри окна «Сохранить вход». Телефон, код и CAPTCHA не отправляются "
+            "сообщениями боту.",
+            reply_markup=account_auth_keyboard(url),
         )
         await callback.answer()
 
@@ -556,6 +713,7 @@ def create_router(context: HandlerContext) -> Router:
             "/import — массовый импорт ссылок\n"
             "/export — экспорт CSV/JSON\n"
             "/folders — папки и теги\n"
+            "/users pending|approved|blocked — пользователи (админ)\n"
             "/status — состояние сервиса\n"
             "/cancel — отменить текущий ввод\n\n"
             "Бот уведомляет о суммарном падении от контрольной цены. После уведомления "

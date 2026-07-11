@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -81,10 +82,20 @@ class Settings:
     mpstats_token: str = ""
     mpstats_api_url: str = "https://mpstats.io/api/analytics/v1/wb"
     mpstats_max_age_hours: int = 24
+    auth_public_url: str = ""
+    auth_bind_host: str = "0.0.0.0"
+    auth_port: int = 8080
+    auth_session_ttl_seconds: int = 600
+    auth_max_concurrent_sessions: int = 2
+    registration_mode: str = "approval"
 
     @property
     def database_path(self) -> Path:
         return self.data_dir / "wb-price-bot.sqlite3"
+
+    @property
+    def auth_enabled(self) -> bool:
+        return bool(self.auth_public_url)
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -108,6 +119,34 @@ class Settings:
             raise ConfigurationError(
                 "APP_TIMEZONE должна быть IANA-зоной, например Asia/Irkutsk"
             ) from exc
+
+        auth_public_url = (
+            os.getenv("AUTH_PUBLIC_URL", "").strip()
+            or os.getenv("AUTH_FALLBACK_PUBLIC_URL", "").strip()
+        ).rstrip("/")
+        if auth_public_url:
+            parsed_auth_url = urlparse(auth_public_url)
+            if (
+                parsed_auth_url.scheme != "https"
+                or not parsed_auth_url.hostname
+                or parsed_auth_url.username
+                or parsed_auth_url.password
+                or parsed_auth_url.query
+                or parsed_auth_url.fragment
+                or parsed_auth_url.path not in {"", "/"}
+            ):
+                raise ConfigurationError(
+                    "AUTH_PUBLIC_URL должен быть HTTPS-адресом без логина, пути, query и fragment"
+                )
+        registration_mode = os.getenv("REGISTRATION_MODE", "approval").strip().lower()
+        if registration_mode not in {"approval", "open", "allowlist"}:
+            raise ConfigurationError("REGISTRATION_MODE должен быть approval, open или allowlist")
+        auth_port = _positive_int("AUTH_PORT", 8080, 1)
+        if auth_port > 65535:
+            raise ConfigurationError("AUTH_PORT должен быть от 1 до 65535")
+        auth_slots = _positive_int("AUTH_MAX_CONCURRENT_SESSIONS", 2, 1)
+        if auth_slots > 10:
+            raise ConfigurationError("AUTH_MAX_CONCURRENT_SESSIONS должен быть от 1 до 10")
 
         return cls(
             telegram_token=token,
@@ -136,4 +175,10 @@ class Settings:
                 "MPSTATS_API_URL", "https://mpstats.io/api/analytics/v1/wb"
             ).strip(),
             mpstats_max_age_hours=_positive_int("MPSTATS_MAX_AGE_HOURS", 24, 1),
+            auth_public_url=auth_public_url,
+            auth_bind_host=os.getenv("AUTH_BIND_HOST", "0.0.0.0").strip() or "0.0.0.0",
+            auth_port=auth_port,
+            auth_session_ttl_seconds=_positive_int("AUTH_SESSION_TTL_SECONDS", 600, 300),
+            auth_max_concurrent_sessions=auth_slots,
+            registration_mode=registration_mode,
         )

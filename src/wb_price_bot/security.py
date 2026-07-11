@@ -142,6 +142,6 @@ def normalize_wb_session(raw: str, *, require_auth_marker: bool = True) -> str:
         raise SessionFormatError("В сессии не найдены cookies")
     if require_auth_marker and not state.get("origins"):
         raise SessionFormatError(
-            "Нет данных авторизованного браузера. Используйте scripts/capture_wb_session.py."
+            "В браузерной сессии нет локальных данных Wildberries; завершите вход и повторите"
         )
     return json.dumps(state, ensure_ascii=False, separators=(",", ":"), sort_keys=True)

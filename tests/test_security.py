@@ -57,7 +57,7 @@ def test_session_without_browser_origin_is_rejected_by_default() -> None:
             "origins": [],
         }
     )
-    with pytest.raises(SessionFormatError, match="браузера"):
+    with pytest.raises(SessionFormatError, match="браузер"):
         normalize_wb_session(raw)
 
 

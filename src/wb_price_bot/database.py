@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import sqlite3
 from collections import defaultdict
 from collections.abc import Sequence, Set
@@ -29,6 +30,7 @@ from .domain import (
     utcnow,
 )
 from .models import (
+    AuthSession,
     Base,
     NotificationOutbox,
     PriceHistory,
@@ -98,6 +100,10 @@ class DigestItem:
 
 _MIGRATION_COLUMNS: dict[str, dict[str, str]] = {
     "users": {
+        "access_status": "VARCHAR(20) NOT NULL DEFAULT 'approved'",
+        "access_requested_at": "DATETIME",
+        "access_reviewed_at": "DATETIME",
+        "access_reviewed_by": "BIGINT",
         "wb_destination": "INTEGER",
         "region_label": "VARCHAR(200)",
         "quiet_start_minute": "INTEGER",
@@ -199,6 +205,7 @@ class Database:
         display_name: str,
         *,
         is_admin: bool,
+        auto_approve: bool = True,
     ) -> User:
         async with self._sessions() as session, session.begin():
             user = await session.scalar(select(User).where(User.telegram_id == telegram_id))
@@ -208,15 +215,252 @@ class Database:
                     username=username,
                     display_name=display_name[:128],
                     is_admin=is_admin,
+                    is_enabled=is_admin or auto_approve,
+                    access_status="approved" if is_admin or auto_approve else "pending",
+                    access_requested_at=None if is_admin or auto_approve else utcnow(),
                 )
                 session.add(user)
             else:
                 user.username = username
                 user.display_name = display_name[:128]
-                user.is_admin = user.is_admin or is_admin
-                user.is_enabled = True
+                # Конфигурация сервера — единственный источник админских прав.
+                user.is_admin = is_admin
+                if is_admin:
+                    user.access_status = "approved"
+                    user.is_enabled = True
+                elif auto_approve and user.access_status == "pending":
+                    user.access_status = "approved"
+                    user.is_enabled = True
+                    user.access_reviewed_at = utcnow()
+                elif user.access_status == "pending" and user.access_requested_at is None:
+                    user.access_requested_at = utcnow()
             await session.flush()
             return user
+
+    async def approved_telegram_ids(self, configured_admins: Set[int]) -> set[int]:
+        async with self._sessions() as session:
+            approved = set(
+                (
+                    await session.scalars(
+                        select(User.telegram_id).where(
+                            User.access_status == "approved",
+                            User.is_enabled.is_(True),
+                        )
+                    )
+                ).all()
+            )
+        return approved | set(configured_admins)
+
+    async def review_user_access(
+        self,
+        admin_telegram_id: int,
+        target_telegram_id: int,
+        *,
+        approve: bool,
+        configured_admins: Set[int],
+    ) -> User | None:
+        async with self._sessions() as session, session.begin():
+            if admin_telegram_id not in configured_admins:
+                raise PermissionError("Только администратор может управлять доступом")
+            user = await session.scalar(select(User).where(User.telegram_id == target_telegram_id))
+            if user is None:
+                return None
+            if user.telegram_id in configured_admins and not approve:
+                raise ValueError("Сначала удалите администратора из TELEGRAM_ALLOWED_USERS")
+            if user.telegram_id == admin_telegram_id and not approve:
+                raise ValueError("Нельзя заблокировать собственный аккаунт администратора")
+            user.access_status = "approved" if approve else "blocked"
+            user.is_enabled = approve
+            user.access_reviewed_at = utcnow()
+            user.access_reviewed_by = admin_telegram_id
+            return user
+
+    async def pending_users(self) -> list[User]:
+        return await self.users_by_access_status("pending")
+
+    async def users_by_access_status(self, status: str, *, limit: int = 100) -> list[User]:
+        if status not in {"pending", "approved", "blocked"}:
+            raise ValueError("Неизвестный статус доступа")
+        async with self._sessions() as session:
+            return list(
+                (
+                    await session.scalars(
+                        select(User)
+                        .where(User.access_status == status)
+                        .order_by(User.access_requested_at, User.id)
+                        .limit(limit)
+                    )
+                ).all()
+            )
+
+    async def create_auth_session(self, telegram_id: int, ttl_seconds: int) -> AuthSession:
+        async with self._sessions() as session, session.begin():
+            user = await self._require_user(session, telegram_id)
+            if user.access_status != "approved" or not user.is_enabled:
+                raise PermissionError("Доступ пользователя не одобрен")
+            active = (
+                await session.scalars(
+                    select(AuthSession).where(
+                        AuthSession.user_id == user.id,
+                        AuthSession.status.in_(("pending", "active", "queued")),
+                    )
+                )
+            ).all()
+            for item in active:
+                item.status = "cancelled"
+                item.last_error = "Создано новое окно авторизации"
+            auth_session = AuthSession(
+                id=secrets.token_urlsafe(32),
+                user_id=user.id,
+                status="pending",
+                expires_at=utcnow() + timedelta(seconds=ttl_seconds),
+            )
+            session.add(auth_session)
+            await session.flush()
+            return auth_session
+
+    async def get_auth_session(
+        self, session_id: str, telegram_id: int | None = None
+    ) -> AuthSession | None:
+        async with self._sessions() as session:
+            query = select(AuthSession).where(AuthSession.id == session_id)
+            if telegram_id is not None:
+                query = query.join(User, AuthSession.user_id == User.id).where(
+                    User.telegram_id == telegram_id
+                )
+            return cast(AuthSession | None, await session.scalar(query))
+
+    async def queue_auth_session(self, session_id: str, telegram_id: int) -> bool:
+        async with self._sessions() as session, session.begin():
+            user_id = (
+                select(User.id)
+                .where(
+                    User.telegram_id == telegram_id,
+                    User.access_status == "approved",
+                    User.is_enabled.is_(True),
+                )
+                .scalar_subquery()
+            )
+            result = await session.execute(
+                update(AuthSession)
+                .where(
+                    AuthSession.id == session_id,
+                    AuthSession.user_id == user_id,
+                    AuthSession.status == "pending",
+                    AuthSession.expires_at > utcnow(),
+                )
+                .values(status="queued", last_error=None)
+            )
+            return int(result.rowcount or 0) == 1  # type: ignore[attr-defined]
+
+    async def activate_auth_session(self, session_id: str, telegram_id: int) -> bool:
+        async with self._sessions() as session, session.begin():
+            user_id = (
+                select(User.id)
+                .where(
+                    User.telegram_id == telegram_id,
+                    User.access_status == "approved",
+                    User.is_enabled.is_(True),
+                )
+                .scalar_subquery()
+            )
+            now = utcnow()
+            result = await session.execute(
+                update(AuthSession)
+                .where(
+                    AuthSession.id == session_id,
+                    AuthSession.user_id == user_id,
+                    AuthSession.status.in_(("pending", "queued")),
+                    AuthSession.expires_at > now,
+                )
+                .values(status="active", last_error=None)
+            )
+            if int(result.rowcount or 0) == 1:  # type: ignore[attr-defined]
+                return True
+            await session.execute(
+                update(AuthSession)
+                .where(
+                    AuthSession.id == session_id,
+                    AuthSession.user_id == user_id,
+                    AuthSession.status.in_(("pending", "queued")),
+                    AuthSession.expires_at <= now,
+                )
+                .values(status="expired", last_error="Срок действия окна входа истёк")
+            )
+            return False
+
+    async def complete_auth_session(
+        self, session_id: str, telegram_id: int, encrypted_session: str
+    ) -> bool:
+        """Atomically consume an active auth window and store its WB browser state."""
+        async with self._sessions() as session, session.begin():
+            user_id = (
+                select(User.id)
+                .where(
+                    User.telegram_id == telegram_id,
+                    User.access_status == "approved",
+                    User.is_enabled.is_(True),
+                )
+                .scalar_subquery()
+            )
+            result = await session.execute(
+                update(AuthSession)
+                .where(
+                    AuthSession.id == session_id,
+                    AuthSession.user_id == user_id,
+                    AuthSession.status == "active",
+                    AuthSession.expires_at > utcnow(),
+                )
+                .values(status="succeeded", last_error=None)
+            )
+            if int(result.rowcount or 0) != 1:  # type: ignore[attr-defined]
+                return False
+            user = await self._require_user(session, telegram_id)
+            await self._store_wb_account(session, user, encrypted_session)
+            return True
+
+    async def set_auth_session_status(
+        self,
+        session_id: str,
+        status: str,
+        error: str | None = None,
+        *,
+        expected_statuses: Sequence[str] | None = None,
+    ) -> bool:
+        async with self._sessions() as session, session.begin():
+            statement = update(AuthSession).where(AuthSession.id == session_id)
+            if expected_statuses is not None:
+                statement = statement.where(AuthSession.status.in_(tuple(expected_statuses)))
+            result = await session.execute(
+                statement.values(
+                    status=status[:20],
+                    last_error=error[:500] if error else None,
+                )
+            )
+            return int(result.rowcount or 0) == 1  # type: ignore[attr-defined]
+
+    async def expire_auth_sessions(self) -> int:
+        async with self._sessions() as session, session.begin():
+            result = await session.execute(
+                update(AuthSession)
+                .where(
+                    AuthSession.expires_at < utcnow(),
+                    AuthSession.status.in_(("pending", "queued", "active")),
+                )
+                .values(status="expired", last_error="Срок действия окна входа истёк")
+            )
+            return int(result.rowcount or 0)  # type: ignore[attr-defined]
+
+    async def prune_auth_sessions(self, days: int = 7) -> int:
+        cutoff = utcnow() - timedelta(days=days)
+        async with self._sessions() as session, session.begin():
+            result = await session.execute(
+                delete(AuthSession).where(
+                    AuthSession.created_at < cutoff,
+                    AuthSession.status.in_(("succeeded", "failed", "expired", "cancelled")),
+                )
+            )
+            return int(result.rowcount or 0)  # type: ignore[attr-defined]
 
     async def get_user(self, telegram_id: int) -> User | None:
         async with self._sessions() as session:
@@ -619,32 +863,35 @@ class Database:
     async def save_wb_account(self, telegram_id: int, encrypted_session: str) -> None:
         async with self._sessions() as session, session.begin():
             user = await self._require_user(session, telegram_id)
-            account = await session.scalar(select(WBAccount).where(WBAccount.user_id == user.id))
-            if account is None:
-                session.add(
-                    WBAccount(
-                        user_id=user.id,
-                        encrypted_session=encrypted_session,
-                        status="active",
-                    )
+            await self._store_wb_account(session, user, encrypted_session)
+
+    async def _store_wb_account(
+        self, session: AsyncSession, user: User, encrypted_session: str
+    ) -> None:
+        account = await session.scalar(select(WBAccount).where(WBAccount.user_id == user.id))
+        if account is None:
+            session.add(
+                WBAccount(
+                    user_id=user.id,
+                    encrypted_session=encrypted_session,
+                    status="active",
                 )
-            else:
-                account.encrypted_session = encrypted_session
-                account.status = "active"
-                account.last_error = None
-                account.last_validated_at = None
-            products = (
-                await session.scalars(select(Product).where(Product.user_id == user.id))
-            ).all()
-            for product in products:
-                product.reference_price = None
-                product.alert_latched = False
-                rules = _load_rules(product.rules_json)
-                for rule in rules:
-                    rule.reference_price = None
-                    rule.alert_latched = False
-                product.rules_json = _dump_rules(rules)
-                product.price_source = "context_reset"
+            )
+        else:
+            account.encrypted_session = encrypted_session
+            account.status = "active"
+            account.last_error = None
+            account.last_validated_at = None
+        products = (await session.scalars(select(Product).where(Product.user_id == user.id))).all()
+        for product in products:
+            product.reference_price = None
+            product.alert_latched = False
+            rules = _load_rules(product.rules_json)
+            for rule in rules:
+                rule.reference_price = None
+                rule.alert_latched = False
+            product.rules_json = _dump_rules(rules)
+            product.price_source = "context_reset"
 
     async def get_wb_account(self, telegram_id: int) -> WBAccount | None:
         async with self._sessions() as session:

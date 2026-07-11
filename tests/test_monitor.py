@@ -115,6 +115,36 @@ async def test_monitor_deduplicates_public_product_and_sends_alert(settings: Set
 
 
 @pytest.mark.asyncio
+async def test_allowlist_mode_excludes_previously_approved_users(settings: Settings) -> None:
+    database = Database(settings.database_path)
+    await database.initialize()
+    await database.ensure_user(2002, None, "Former user", is_admin=False, auto_approve=True)
+    await database.add_product(
+        telegram_id=2002,
+        snapshot=make_snapshot(price=100_000),
+        threshold_kind=ThresholdKind.PERCENT,
+        threshold_value=1000,
+        max_products=20,
+    )
+    public = FakePublicClient(80_000)
+    monitor = PriceMonitor(
+        settings=replace(
+            settings,
+            allowed_users=frozenset({1001}),
+            registration_mode="allowlist",
+        ),
+        database=database,
+        bot=FakeBot(),  # type: ignore[arg-type]
+        public_client=public,  # type: ignore[arg-type]
+        account_client=FailingAccountClient(),  # type: ignore[arg-type]
+        cipher=SessionCipher(settings.session_encryption_key),
+    )
+    await monitor.check_all()
+    assert public.calls == []
+    await database.close()
+
+
+@pytest.mark.asyncio
 async def test_licensed_fallback_never_replaces_selected_size(settings: Settings) -> None:
     database = Database(settings.database_path)
     await database.initialize()
@@ -273,7 +303,7 @@ async def test_account_product_failure_does_not_block_other_products(settings: S
 
 
 @pytest.mark.asyncio
-async def test_removed_allowlist_user_does_not_receive_queued_alert(settings: Settings) -> None:
+async def test_blocked_user_does_not_receive_queued_alert(settings: Settings) -> None:
     database = Database(settings.database_path)
     await database.initialize()
     await database.ensure_user(1001, None, "Owner", is_admin=True)
@@ -285,6 +315,12 @@ async def test_removed_allowlist_user_does_not_receive_queued_alert(settings: Se
         max_products=20,
     )
     assert await database.apply_snapshot(product.id, make_snapshot(price=90_000)) is not None
+    await database.review_user_access(
+        1002,
+        1001,
+        approve=False,
+        configured_admins=frozenset({1002}),
+    )
     bot = FakeBot()
     monitor = PriceMonitor(
         settings=replace(settings, allowed_users=frozenset({1002})),

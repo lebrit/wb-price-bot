@@ -21,6 +21,10 @@ class User(Base):
     display_name: Mapped[str] = mapped_column(String(128), default="")
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    access_status: Mapped[str] = mapped_column(String(20), default="approved")
+    access_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    access_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    access_reviewed_by: Mapped[int | None] = mapped_column(BigInteger)
     wb_destination: Mapped[int | None] = mapped_column(Integer)
     region_label: Mapped[str | None] = mapped_column(String(200))
     quiet_start_minute: Mapped[int | None] = mapped_column(Integer)
@@ -39,6 +43,9 @@ class User(Base):
     wb_account: Mapped[WBAccount | None] = relationship(
         back_populates="user", cascade="all, delete-orphan", uselist=False
     )
+    auth_sessions: Mapped[list[AuthSession]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
 
 
 class WBAccount(Base):
@@ -56,6 +63,26 @@ class WBAccount(Base):
     )
 
     user: Mapped[User] = relationship(back_populates="wb_account")
+
+
+class AuthSession(Base):
+    __tablename__ = "auth_sessions"
+    __table_args__ = (
+        Index("ix_auth_sessions_user_status", "user_id", "status"),
+        Index("ix_auth_sessions_expires", "expires_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(String(500))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    user: Mapped[User] = relationship(back_populates="auth_sessions")
 
 
 class Product(Base):

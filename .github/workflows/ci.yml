@@ -36,6 +36,12 @@ jobs:
           mkdir -p data secrets
           touch secrets/telegram-token secrets/session-key secrets/mpstats-token
           cp .env.example .env
+          export AUTH_DOMAIN=auth.example.com
           docker compose config >/dev/null
+      - name: Validate Caddy configuration
+        run: >-
+          docker run --rm -e AUTH_DOMAIN=auth.example.com
+          -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro"
+          caddy:2.10.2-alpine caddy validate --config /etc/caddy/Caddyfile
       - name: Build image
         run: docker build -t wb-price-bot:ci .

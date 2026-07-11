@@ -8,8 +8,24 @@ sudo wb-price-bot doctor
 sudo wb-price-bot logs
 ```
 
-Healthcheck проверяет SQLite и свежесть heartbeat мониторинга. После первого запуска Chromium
-образ может стартовать дольше обычного; установщик ждёт до пяти минут.
+Healthcheck bot проверяет SQLite и свежесть heartbeat мониторинга, auth — HTTP и SQLite,
+Caddy — валидность конфигурации. После первого запуска Chromium образ может стартовать
+дольше обычного; установщик ждёт до пяти минут.
+
+## Домен и HTTPS
+
+До установки создайте A/AAAA-запись домена на сервер. Caddy занимает `80/tcp`, `443/tcp` и
+`443/udp`, автоматически получает и обновляет сертификат. Настройки находятся в
+`AUTH_DOMAIN` и `AUTH_PUBLIC_URL`; изменить и проверить их можно в `sudo wb-price-bot` →
+«Web-авторизация и пользователи». Установщик не меняет firewall и не останавливает чужой
+reverse proxy.
+
+Проверка:
+
+```bash
+curl -fsS https://auth.example.com/health
+sudo wb-price-bot doctor
+```
 
 ## Обновление
 
@@ -23,7 +39,7 @@ Healthcheck проверяет SQLite и свежесть heartbeat монито
 ## Backup и восстановление
 
 Откройте `sudo wb-price-bot` → «Резервные копии». Восстановление проверяет
-`PRAGMA integrity_check`, делает предвосстановительную копию, останавливает bot, атомарно
+`PRAGMA integrity_check`, делает предвосстановительную копию, останавливает bot и auth, атомарно
 заменяет базу и ждёт healthcheck. При неудаче старая база возвращается.
 
 Операторские копии находятся в `/var/backups/wb-price-bot`. Telegram token и Fernet key в
@@ -44,6 +60,27 @@ Healthcheck проверяет SQLite и свежесть heartbeat монито
 - `/export` — CSV или JSON без токенов, сессий и Telegram-координат;
 - `/folders`, `/folder ИМЯ`, `/tag ТЕГ` — организация и фильтры.
 
+## Пользователи
+
+`TELEGRAM_ALLOWED_USERS` — администраторы. В режиме `approval` новый пользователь после
+`/start` получает `pending`, а администраторы — кнопки решения. Просмотр и повторное изменение:
+
+```text
+/users pending
+/users approved
+/users blocked
+```
+
+`open` одобряет нового пользователя автоматически; `allowlist` полностью запрещает заявки.
+Блокировка сразу исключает товары пользователя из мониторинга и отменяет доставку его outbox.
+
+## Окна авторизации
+
+По умолчанию одновременно работают два Chromium (`AUTH_MAX_CONCURRENT_SESSIONS=2`), остальные
+окна ждут в очереди. Срок — 600 секунд. Незавершённые окна помечаются cancelled/expired, а
+старые служебные записи удаляются автоматически. Перезапуск `auth` обрывает только текущие
+окна входа и не удаляет уже сохранённые WB-сессии.
+
 ## MPSTATS fallback
 
 Откройте `sudo wb-price-bot` → «Лицензированный источник MPSTATS», добавьте API token и
@@ -56,6 +93,7 @@ Healthcheck проверяет SQLite и свежесть heartbeat монито
 
 - `429` — увеличьте интервал;
 - `403/498` после fallback через `curl` — остановите проверки и дождитесь восстановления доступа;
-- account session error — снова выполните ручной capture;
+- account session error — переподключите аккаунт через `/account`;
+- Mini App не открывается — проверьте DNS, сертификат, `AUTH_PUBLIC_URL` и WebSocket через Caddy;
 - MPSTATS authorization/stale-data error — проверьте token, тариф и время обновления;
 - неизвестная схема — обновите адаптер и contract fixtures, не подставляйте цену `0`.

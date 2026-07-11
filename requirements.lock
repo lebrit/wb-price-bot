@@ -1,4 +1,4 @@
-# Runtime lock for the Docker image (Python 3.12, generated 2026-07-10).
+# Runtime lock for the Docker image (Python 3.12, verified 2026-07-11).
 aiofiles==25.1.0
 aiogram==3.29.1
 aiohappyeyeballs==2.7.1

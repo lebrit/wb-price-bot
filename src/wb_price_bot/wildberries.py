@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 _CARD_PATH_FRAGMENT = "/cards/v4/detail"
 _PRICE_TEXT_RE = re.compile(r"(\d[\d\s\u00a0]{0,15})\s*[₽р]", re.IGNORECASE)
-_PUBLIC_USER_AGENT = "WB-Price-Bot/0.2 (+https://github.com/lebrit/wb-price-bot)"
+_PUBLIC_USER_AGENT = "WB-Price-Bot/0.3 (+https://github.com/lebrit/wb-price-bot)"
 
 
 class WildberriesError(RuntimeError):

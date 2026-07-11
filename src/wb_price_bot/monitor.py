@@ -83,8 +83,9 @@ class PriceMonitor:
 
     async def check_all(self) -> None:
         async with self._cycle_lock:
+            allowed_users = await self._allowed_users()
             targets = await self._database.active_targets(
-                self._settings.allowed_users, self._settings.wb_destination
+                allowed_users, self._settings.wb_destination
             )
             public_targets = [item for item in targets if item.account_status is None]
             public_groups: dict[int, list[WatchTarget]] = defaultdict(list)
@@ -99,7 +100,7 @@ class PriceMonitor:
                     account_groups[target.user_id].append(target)
             for group in account_groups.values():
                 await self._check_account(group)
-            await self.drain_outbox()
+            await self.drain_outbox(allowed_users)
 
     async def check_product(self, telegram_id: int, product_id: int) -> PriceSnapshot:
         async with self._cycle_lock:
@@ -289,11 +290,13 @@ class PriceMonitor:
                 missing, "Wildberries не вернул товар в пакетном ответе"
             )
 
-    async def drain_outbox(self) -> None:
-        preferences = await self._database.notification_preferences(self._settings.allowed_users)
+    async def drain_outbox(self, allowed_users: set[int] | None = None) -> None:
+        if allowed_users is None:
+            allowed_users = await self._allowed_users()
+        preferences = await self._database.notification_preferences(allowed_users)
         local_time = utcnow().astimezone(self._timezone).time()
         for alert in await self._database.pending_alerts(limit=100):
-            if alert.telegram_id not in self._settings.allowed_users:
+            if alert.telegram_id not in allowed_users:
                 await self._database.discard_alert(
                     alert.outbox_id, "Telegram ID removed from allowlist"
                 )
@@ -310,7 +313,8 @@ class PriceMonitor:
     async def send_due_digests(self) -> None:
         now = utcnow().astimezone(self._timezone)
         minute = now.hour * 60 + now.minute
-        preferences = await self._database.notification_preferences(self._settings.allowed_users)
+        allowed_users = await self._allowed_users()
+        preferences = await self._database.notification_preferences(allowed_users)
         for preference in preferences.values():
             if (
                 not preference.daily_digest_enabled
@@ -363,6 +367,11 @@ class PriceMonitor:
                 )
                 continue
             await self._database.mark_digest_sent(preference.telegram_id, now.date())
+
+    async def _allowed_users(self) -> set[int]:
+        if self._settings.registration_mode == "allowlist":
+            return set(self._settings.allowed_users)
+        return await self._database.approved_telegram_ids(self._settings.allowed_users)
 
     async def _send_alert(self, alert: PendingAlert) -> None:
         decision = alert.decision
@@ -436,6 +445,8 @@ class PriceMonitor:
             return
         self._last_prune_date = today
         deleted = await self._database.prune_history(self._settings.price_history_days)
+        await self._database.expire_auth_sessions()
+        await self._database.prune_auth_sessions()
         if deleted:
             logger.info("Удалено старых записей истории: %s", deleted)
 

@@ -55,15 +55,78 @@ async def test_initialize_migrates_v010_database_and_is_idempotent(settings: Set
     await database.initialize()
     await database.initialize()
     product = await database.get_product(1001, 1)
+    user = await database.get_user(1001)
     rules = await database.product_rules(1001, 1)
 
     assert product is not None
     assert product.rules_json != "[]"
     assert product.tags_json == "[]"
+    assert user is not None and user.access_status == "approved"
     assert len(rules) == 1
     assert rules[0].kind is ThresholdKind.PERCENT
     assert rules[0].value == 1000
     assert rules[0].reference_price == 100_000
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_user_approval_and_auth_sessions_are_isolated(settings: Settings) -> None:
+    database = Database(settings.database_path)
+    await database.initialize()
+    await database.ensure_user(1001, "admin", "Admin", is_admin=True)
+    pending = await database.ensure_user(
+        2002,
+        "guest",
+        "Guest",
+        is_admin=False,
+        auto_approve=False,
+    )
+    assert pending.access_status == "pending"
+    assert await database.approved_telegram_ids(frozenset({1001})) == {1001}
+
+    reviewed = await database.review_user_access(
+        1001,
+        2002,
+        approve=True,
+        configured_admins=frozenset({1001}),
+    )
+    assert reviewed is not None and reviewed.access_status == "approved"
+    assert await database.approved_telegram_ids(frozenset({1001})) == {1001, 2002}
+
+    first = await database.create_auth_session(2002, 600)
+    assert await database.get_auth_session(first.id, 1001) is None
+    assert await database.activate_auth_session(first.id, 1001) is False
+    assert await database.queue_auth_session(first.id, 2002) is True
+    assert await database.activate_auth_session(first.id, 2002) is True
+    second = await database.create_auth_session(2002, 600)
+    cancelled = await database.get_auth_session(first.id, 2002)
+    assert cancelled is not None and cancelled.status == "cancelled"
+    assert await database.queue_auth_session(first.id, 2002) is False
+    assert await database.complete_auth_session(first.id, 2002, "encrypted-old") is False
+    assert await database.get_wb_account(2002) is None
+    assert await database.activate_auth_session(second.id, 2002) is True
+    assert await database.complete_auth_session(second.id, 2002, "encrypted-new") is True
+    account = await database.get_wb_account(2002)
+    completed = await database.get_auth_session(second.id, 2002)
+    assert account is not None and account.encrypted_session == "encrypted-new"
+    assert completed is not None and completed.status == "succeeded"
+    assert (
+        await database.set_auth_session_status(second.id, "failed", expected_statuses=("active",))
+        is False
+    )
+
+    expired = await database.create_auth_session(2002, -1)
+    assert await database.activate_auth_session(expired.id, 2002) is False
+    expired_after = await database.get_auth_session(expired.id, 2002)
+    assert expired_after is not None and expired_after.status == "expired"
+
+    with pytest.raises(PermissionError, match="администратор"):
+        await database.review_user_access(
+            1001,
+            2002,
+            approve=False,
+            configured_admins=frozenset({9999}),
+        )
     await database.close()
 
 

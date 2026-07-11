@@ -63,6 +63,7 @@ async def run_bot(settings: Settings) -> None:
             BotCommand(command="import", description="Массовый импорт"),
             BotCommand(command="export", description="Экспорт CSV/JSON"),
             BotCommand(command="folders", description="Папки и теги"),
+            BotCommand(command="users", description="Заявки пользователей (админ)"),
             BotCommand(command="status", description="Состояние сервиса"),
             BotCommand(command="help", description="Помощь"),
             BotCommand(command="cancel", description="Отменить ввод"),

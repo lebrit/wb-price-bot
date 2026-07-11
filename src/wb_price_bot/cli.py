@@ -12,6 +12,7 @@ from pathlib import Path
 from cryptography.fernet import Fernet
 
 from . import __version__
+from .auth_web import run_auth_server
 from .bot import run_bot
 from .config import ConfigurationError, Settings
 from .database import Database, normalize_datetime
@@ -24,6 +25,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="wb-price-bot")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("run", help="Запустить Telegram-бота")
+    subparsers.add_parser("auth-server", help="Запустить Mini App авторизации WB")
     subparsers.add_parser("healthcheck", help="Проверить процесс и SQLite")
     subparsers.add_parser("integrity-check", help="Запустить PRAGMA integrity_check")
     subparsers.add_parser("stats", help="Показать статистику")
@@ -88,6 +90,9 @@ def main() -> None:
 async def _run_command(args: argparse.Namespace, settings: Settings) -> int:
     if args.command == "run":
         await run_bot(settings)
+        return 0
+    if args.command == "auth-server":
+        await run_auth_server(settings)
         return 0
 
     database = Database(settings.database_path)

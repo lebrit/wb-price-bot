@@ -15,6 +15,8 @@ BACKUP_DIR="/var/backups/${APP_NAME}"
 WRAPPER="/usr/local/bin/${APP_NAME}"
 LOCK_FILE="/run/lock/${APP_NAME}.lock"
 CONTAINER_NAME="wb-price-bot"
+AUTH_CONTAINER_NAME="wb-price-bot-auth"
+CADDY_CONTAINER_NAME="wb-price-bot-caddy"
 PROMPT_FD=""
 COMPOSE_MODE=""
 LOCKED=0
@@ -129,16 +131,19 @@ ensure_docker() {
 
 compose_at() {
   local release="$1"
+  local auth_domain app_version
   shift
   [[ -f "${release}/VERSION" ]] || { warn "в каталоге релиза нет VERSION"; return 1; }
   export WB_CONFIG_FILE="${CONFIG_FILE}"
   export WB_DATA_DIR="${DATA_DIR}"
   export WB_SECRETS_DIR="${SECRETS_DIR}"
   export COMPOSE_PROJECT_NAME="wb-price-bot"
-  APP_VERSION="$(tr -d '[:space:]' <"${release}/VERSION")" || return 1
-  [[ "${APP_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+  auth_domain="$(read_config_value AUTH_DOMAIN 2>/dev/null || true)"
+  export AUTH_DOMAIN="${auth_domain:-localhost}"
+  app_version="$(tr -d '[:space:]' <"${release}/VERSION")" || return 1
+  [[ "${app_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
     || { warn "в каталоге релиза указан неверный VERSION"; return 1; }
-  export APP_VERSION
+  export APP_VERSION="${app_version}"
   if [[ "${COMPOSE_MODE}" == "plugin" ]]; then
     docker compose -f "${release}/compose.yaml" "$@"
   else
@@ -251,11 +256,21 @@ telegram_username() {
 }
 
 validate_allowed_ids() {
-  [[ "$1" =~ ^[0-9]+([,;][0-9]+)*$ ]]
+  local value="${1//;/,}" id
+  local ids=()
+  [[ "${value}" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 1
+  IFS=',' read -r -a ids <<<"${value}"
+  for id in "${ids[@]}"; do
+    [[ "${id}" =~ ^[1-9][0-9]*$ ]] || return 1
+  done
+}
+
+validate_domain() {
+  [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]
 }
 
 write_config() {
-  local ids="$1" interval="$2" destination="$3" tmp
+  local ids="$1" interval="$2" destination="$3" domain="$4" registration="$5" slots="$6" tmp
   tmp="$(mktemp "${CONFIG_DIR}/.config.XXXXXX")"
   cat >"${tmp}" <<EOF
 TELEGRAM_ALLOWED_USERS=${ids//;/,}
@@ -273,6 +288,13 @@ APP_TIMEZONE=Asia/Irkutsk
 MAX_BULK_IMPORT=50
 MAX_RULES_PER_PRODUCT=10
 MPSTATS_MAX_AGE_HOURS=24
+AUTH_DOMAIN=${domain}
+AUTH_PUBLIC_URL=https://${domain}
+AUTH_BIND_HOST=0.0.0.0
+AUTH_PORT=8080
+AUTH_SESSION_TTL_SECONDS=600
+AUTH_MAX_CONCURRENT_SESSIONS=${slots}
+REGISTRATION_MODE=${registration}
 EOF
   chown root:10001 "${tmp}"
   chmod 640 "${tmp}"
@@ -323,22 +345,55 @@ create_session_key() {
 }
 
 configure_first_install() {
-  local token ids interval destination
+  local token ids interval destination domain registration slots
   if [[ -s "${SECRETS_DIR}/telegram-token" && -s "${CONFIG_FILE}" ]]; then
     return 0
   fi
   read_secret token "Токен Telegram-бота от @BotFather"
   validate_telegram_token "${token}" || die "Telegram отклонил токен"
-  read_prompt ids "Разрешённые Telegram ID через запятую"
+  read_prompt ids "Telegram ID администраторов через запятую"
   validate_allowed_ids "${ids}" || die "Telegram ID должны быть положительными числами"
   read_prompt interval "Интервал проверки в секундах (минимум 900)" "1800"
   [[ "${interval}" =~ ^[0-9]+$ && "${interval}" -ge 900 ]] || die "неверный интервал"
   read_prompt destination "WB dest региона (Иркутск по умолчанию)" "-5827722"
   [[ "${destination}" =~ ^-?[0-9]+$ ]] || die "WB dest должен быть целым числом"
+  read_prompt domain "Домен для защищённого окна авторизации WB (A/AAAA-запись должна вести на сервер)"
+  domain="${domain,,}"
+  validate_domain "${domain}" || die "укажите домен вида auth.example.com без https:// и пути"
+  read_prompt registration "Режим регистрации: approval, open или allowlist" "approval"
+  [[ "${registration}" =~ ^(approval|open|allowlist)$ ]] || die "неверный режим регистрации"
+  read_prompt slots "Одновременных окон авторизации, 1–5" "2"
+  [[ "${slots}" =~ ^[1-5]$ ]] || die "количество окон должно быть от 1 до 5"
   printf '%s\n' "${token}" >"${SECRETS_DIR}/telegram-token"
   chown root:10001 "${SECRETS_DIR}/telegram-token"
   chmod 640 "${SECRETS_DIR}/telegram-token"
-  write_config "${ids}" "${interval}" "${destination}"
+  write_config "${ids}" "${interval}" "${destination}" "${domain}" "${registration}" "${slots}"
+}
+
+ensure_auth_config() {
+  local domain public_url registration slots
+  domain="$(read_config_value AUTH_DOMAIN || true)"
+  if [[ -z "${domain}" || "${domain}" == "localhost" ]] || ! validate_domain "${domain}"; then
+    read_prompt domain "Домен для защищённого окна авторизации WB"
+    domain="${domain,,}"
+    validate_domain "${domain}" || die "укажите домен вида auth.example.com"
+    set_config_value AUTH_DOMAIN "${domain}"
+  fi
+  public_url="$(read_config_value AUTH_PUBLIC_URL || true)"
+  [[ "${public_url}" == "https://${domain}" ]] \
+    || set_config_value AUTH_PUBLIC_URL "https://${domain}"
+  registration="$(read_config_value REGISTRATION_MODE || true)"
+  if [[ ! "${registration}" =~ ^(approval|open|allowlist)$ ]]; then
+    set_config_value REGISTRATION_MODE approval
+  fi
+  slots="$(read_config_value AUTH_MAX_CONCURRENT_SESSIONS || true)"
+  if [[ ! "${slots}" =~ ^[1-5]$ ]]; then
+    set_config_value AUTH_MAX_CONCURRENT_SESSIONS 2
+  fi
+  [[ -n "$(read_config_value AUTH_BIND_HOST || true)" ]] || set_config_value AUTH_BIND_HOST 0.0.0.0
+  [[ -n "$(read_config_value AUTH_PORT || true)" ]] || set_config_value AUTH_PORT 8080
+  [[ -n "$(read_config_value AUTH_SESSION_TTL_SECONDS || true)" ]] \
+    || set_config_value AUTH_SESSION_TTL_SECONDS 600
 }
 
 install_wrapper() {
@@ -371,10 +426,10 @@ copy_release() {
   printf '%s' "${release}" || return 1
 }
 
-wait_healthy() {
-  local timeout="${1:-240}" elapsed=0 health
+wait_container_healthy() {
+  local container="$1" timeout="${2:-240}" elapsed=0 health
   while ((elapsed < timeout)); do
-    health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${CONTAINER_NAME}" 2>/dev/null || true)"
+    health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${container}" 2>/dev/null || true)"
     if [[ "${health}" == "healthy" ]]; then
       return 0
     fi
@@ -385,6 +440,17 @@ wait_healthy() {
     elapsed=$((elapsed + 5))
   done
   return 1
+}
+
+wait_healthy() {
+  local timeout="${1:-300}"
+  wait_container_healthy "${CONTAINER_NAME}" "${timeout}" || return 1
+  if docker inspect "${AUTH_CONTAINER_NAME}" >/dev/null 2>&1; then
+    wait_container_healthy "${AUTH_CONTAINER_NAME}" "${timeout}" || return 1
+  fi
+  if docker inspect "${CADDY_CONTAINER_NAME}" >/dev/null 2>&1; then
+    wait_container_healthy "${CADDY_CONTAINER_NAME}" "${timeout}" || return 1
+  fi
 }
 
 activate_release() {
@@ -476,6 +542,7 @@ command_install() {
   prepare_directories
   create_session_key
   configure_first_install
+  ensure_auth_config
 
   local source temp_source="" release
   if source="$(source_tree_from_script)"; then
@@ -510,6 +577,7 @@ command_update() {
   [[ -f "${CURRENT_LINK}/VERSION" ]] || die "сначала установите приложение"
   prepare_directories
   create_session_key
+  ensure_auth_config
   local source release
   create_backup || die "не удалось создать резервную копию перед обновлением"
   source="$(mktemp -d)"
@@ -530,7 +598,7 @@ telegram_menu() {
     say "Настройки Telegram"
     say "1) Показать подключённого бота"
     say "2) Добавить или заменить токен"
-    say "3) Изменить разрешённые Telegram ID"
+    say "3) Изменить Telegram ID администраторов"
     say "4) Отправить тестовое сообщение"
     say "0) Назад"
     read_prompt choice "Выберите пункт"
@@ -547,22 +615,22 @@ telegram_menu() {
         chown root:10001 "${SECRETS_DIR}/.telegram-token.tmp"
         chmod 640 "${SECRETS_DIR}/.telegram-token.tmp"
         mv -f "${SECRETS_DIR}/.telegram-token.tmp" "${SECRETS_DIR}/telegram-token"
-        if ! compose_current restart bot || ! wait_healthy 180; then
+        if ! compose_current up -d --force-recreate bot auth || ! wait_healthy 240; then
           warn "новый токен не запустился, возвращаю старый"
           printf '%s\n' "${old}" >"${SECRETS_DIR}/telegram-token"
           chown root:10001 "${SECRETS_DIR}/telegram-token"
           chmod 640 "${SECRETS_DIR}/telegram-token"
-          compose_current restart bot
+          compose_current up -d --force-recreate bot auth
         else
           say "Токен заменён."
         fi
         ;;
       3)
         ids="$(read_config_value TELEGRAM_ALLOWED_USERS)"
-        read_prompt ids "Telegram ID через запятую" "${ids}"
+        read_prompt ids "Telegram ID администраторов через запятую" "${ids}"
         validate_allowed_ids "${ids}" || { warn "неверный список"; continue; }
         set_config_value TELEGRAM_ALLOWED_USERS "${ids//;/,}"
-        compose_current up -d --force-recreate bot
+        compose_current up -d --force-recreate bot auth
         wait_healthy 180 || warn "контейнер ещё не healthy; проверьте журнал"
         ;;
       4)
@@ -705,6 +773,64 @@ monitoring_menu() {
   done
 }
 
+web_auth_menu() {
+  local choice value
+  while true; do
+    say
+    say "Web-авторизация и пользователи"
+    say "Домен: $(read_config_value AUTH_DOMAIN)"
+    say "Регистрация: $(read_config_value REGISTRATION_MODE)"
+    say "Одновременных окон: $(read_config_value AUTH_MAX_CONCURRENT_SESSIONS)"
+    say "1) Изменить домен"
+    say "2) Изменить режим регистрации"
+    say "3) Изменить число браузерных окон"
+    say "4) Проверить HTTPS и auth-сервис"
+    say "5) Перезапустить web-авторизацию"
+    say "0) Назад"
+    read_prompt choice "Выберите пункт"
+    case "${choice}" in
+      1)
+        read_prompt value "Новый домен без https://" "$(read_config_value AUTH_DOMAIN)"
+        value="${value,,}"
+        validate_domain "${value}" || { warn "неверный домен"; continue; }
+        set_config_value AUTH_DOMAIN "${value}"
+        set_config_value AUTH_PUBLIC_URL "https://${value}"
+        compose_current up -d --force-recreate bot auth caddy
+        wait_healthy 300 || warn "сервисы ещё не healthy; проверьте DNS, 80/443 и журнал"
+        ;;
+      2)
+        read_prompt value "approval, open или allowlist" "$(read_config_value REGISTRATION_MODE)"
+        [[ "${value}" =~ ^(approval|open|allowlist)$ ]] || { warn "неверный режим"; continue; }
+        set_config_value REGISTRATION_MODE "${value}"
+        compose_current up -d --force-recreate bot auth
+        wait_healthy 240 || warn "bot/auth ещё не healthy"
+        ;;
+      3)
+        read_prompt value "Одновременных окон, 1–5" "$(read_config_value AUTH_MAX_CONCURRENT_SESSIONS)"
+        [[ "${value}" =~ ^[1-5]$ ]] || { warn "нужно число от 1 до 5"; continue; }
+        set_config_value AUTH_MAX_CONCURRENT_SESSIONS "${value}"
+        compose_current up -d --force-recreate auth
+        wait_healthy 240 || warn "auth-сервис ещё не healthy"
+        ;;
+      4)
+        value="$(read_config_value AUTH_DOMAIN)"
+        if curl -fsS --max-time 20 "https://${value}/health"; then
+          say
+          say "HTTPS и auth-сервис: OK"
+        else
+          warn "проверка не прошла; проверьте DNS домена, доступность 80/443 и журнал Caddy"
+        fi
+        ;;
+      5)
+        compose_current restart auth caddy
+        wait_healthy 240 || warn "web-авторизация ещё не healthy"
+        ;;
+      0) return ;;
+      *) warn "неизвестный пункт" ;;
+    esac
+  done
+}
+
 restore_backup() {
   local name source database_file pre_restore
   ls -1 "${BACKUP_DIR}"/*.sqlite3 2>/dev/null || { warn "резервных копий нет"; return; }
@@ -725,23 +851,23 @@ PY
   rm -f "${pre_restore}" || return 1
   cp -a "${LAST_BACKUP_PATH}" "${pre_restore}" \
     || { warn "не удалось подготовить rollback-копию; bot не остановлен"; return 1; }
-  compose_current stop bot \
-    || { rm -f "${pre_restore}"; warn "не удалось остановить bot; восстановление отменено"; return 1; }
+  compose_current stop bot auth \
+    || { rm -f "${pre_restore}"; warn "не удалось остановить bot/auth; восстановление отменено"; return 1; }
   if ! install -o 10001 -g 10001 -m 0640 "${source}" "${database_file}.tmp" \
     || ! mv -f "${database_file}.tmp" "${database_file}"; then
     warn "не удалось заменить файл базы"
     rm -f "${database_file}.tmp" "${database_file}-wal" "${database_file}-shm"
     [[ -f "${pre_restore}" ]] && mv -f "${pre_restore}" "${database_file}"
-    if ! compose_current up -d bot || ! wait_healthy 240; then
+    if ! compose_current up -d bot auth caddy || ! wait_healthy 240; then
       warn "исходная база возвращена, но bot не восстановил healthy-состояние"
     fi
     return 1
   fi
   rm -f "${database_file}-wal" "${database_file}-shm"
-  if ! compose_current up -d bot || ! wait_healthy 240; then
+  if ! compose_current up -d bot auth caddy || ! wait_healthy 240; then
     warn "восстановленная база не запустилась, возвращаю предыдущую"
-    if ! compose_current stop bot; then
-      warn "не удалось остановить bot; автоматический rollback базы небезопасен"
+    if ! compose_current stop bot auth; then
+      warn "не удалось остановить bot/auth; автоматический rollback базы небезопасен"
       return 1
     fi
     rm -f "${database_file}" "${database_file}-wal" "${database_file}-shm"
@@ -749,7 +875,7 @@ PY
       mv -f "${pre_restore}" "${database_file}"
       chown 10001:10001 "${database_file}"
     fi
-    if ! compose_current up -d bot || ! wait_healthy 240; then
+    if ! compose_current up -d bot auth caddy || ! wait_healthy 240; then
       warn "предыдущая база не вернулась в healthy-состояние"
       return 1
     fi
@@ -795,13 +921,20 @@ doctor() {
     "${SECRETS_DIR}/session-key" \
     "${SECRETS_DIR}/mpstats-token"
   say "MPSTATS fallback: $([[ -s "${SECRETS_DIR}/mpstats-token" ]] && echo настроен || echo выключен)"
-  say "Контейнер:"
-  docker inspect --format 'status={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${CONTAINER_NAME}" 2>/dev/null || true
+  say "Контейнеры:"
+  for container in "${CONTAINER_NAME}" "${AUTH_CONTAINER_NAME}" "${CADDY_CONTAINER_NAME}"; do
+    docker inspect --format '{{.Name}} status={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${container}" 2>/dev/null || true
+  done
   compose_current run --rm -T bot python -m wb_price_bot integrity-check
   if validate_telegram_token "$(<"${SECRETS_DIR}/telegram-token")"; then
     say "Telegram getMe: OK"
   else
     warn "Telegram getMe: ошибка"
+  fi
+  if curl -fsS --max-time 20 "$(read_config_value AUTH_PUBLIC_URL)/health" >/dev/null; then
+    say "Web-авторизация HTTPS: OK"
+  else
+    warn "Web-авторизация HTTPS: ошибка"
   fi
 }
 
@@ -834,7 +967,7 @@ uninstall_menu() {
     2)
       warn "Telegram/MPSTATS token не отзываются автоматически, а WB-сессия удаляется только локально."
       confirm_phrase DELETE-WB-BOT "Полностью удалить WB Price Bot" || { say "Отменено."; return; }
-      if ! compose_current down --remove-orphans --rmi all; then
+      if ! compose_current down --remove-orphans --rmi all --volumes; then
         warn "не удалось остановить контейнеры; полное удаление отменено"
         return 1
       fi
@@ -852,16 +985,18 @@ uninstall_menu() {
 }
 
 menu_header() {
-  local version status health username
+  local version status health username domain
   version="$(<"${CURRENT_LINK}/VERSION")"
   status="$(docker inspect --format '{{.State.Status}}' "${CONTAINER_NAME}" 2>/dev/null || echo stopped)"
   health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}—{{end}}' "${CONTAINER_NAME}" 2>/dev/null || echo '—')"
   username="$(telegram_username 2>/dev/null || true)"
+  domain="$(read_config_value AUTH_DOMAIN 2>/dev/null || true)"
   say
   say "========================================"
   say " ${APP_TITLE} v${version}"
   say " Сервис: ${status}; health: ${health}"
   [[ -n "${username}" ]] && say " Telegram: @${username}"
+  say " Auth: ${domain:-не настроен}"
   say "========================================"
 }
 
@@ -897,9 +1032,10 @@ command_menu() {
     say "8) Аккаунт Wildberries"
     say "9) Настройки мониторинга"
     say "10) Лицензированный источник MPSTATS"
-    say "11) Резервные копии"
-    say "12) Диагностика"
-    say "13) Удаление"
+    say "11) Web-авторизация и пользователи"
+    say "12) Резервные копии"
+    say "13) Диагностика"
+    say "14) Удаление"
     say "0) Выход"
     read_prompt choice "Выберите пункт"
     case "${choice}" in
@@ -913,9 +1049,10 @@ command_menu() {
       8) wb_session_menu ;;
       9) monitoring_menu ;;
       10) licensed_provider_menu ;;
-      11) backup_menu ;;
-      12) doctor ;;
-      13) uninstall_menu ;;
+      11) web_auth_menu ;;
+      12) backup_menu ;;
+      13) doctor ;;
+      14) uninstall_menu ;;
       0) return ;;
       *) warn "неизвестный пункт" ;;
     esac

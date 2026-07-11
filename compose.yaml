@@ -2,7 +2,7 @@ services:
   bot:
     build:
       context: .
-    image: wb-price-bot:${APP_VERSION:-0.2.0}
+    image: wb-price-bot:${APP_VERSION:-0.3.0}
     container_name: wb-price-bot
     restart: unless-stopped
     init: true
@@ -14,12 +14,15 @@ services:
       - no-new-privileges:true
     env_file:
       - ${WB_CONFIG_FILE:-.env}
-    environment:
+    environment: &app_environment
       TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram-token
       SESSION_ENCRYPTION_KEY_FILE: /run/secrets/session-key
       MPSTATS_TOKEN_FILE: /run/secrets/mpstats-token
       DATA_DIR: /data
-    volumes:
+      # Fallback keeps an upgrade from pre-v0.3 installers bootable until the
+      # administrator opens the new menu and supplies the public domain.
+      AUTH_FALLBACK_PUBLIC_URL: ${AUTH_FALLBACK_PUBLIC_URL:-https://localhost}
+    volumes: &app_volumes
       - ${WB_DATA_DIR:-./data}:/data
       - ${WB_SECRETS_DIR:-./secrets}:/run/secrets:ro
     tmpfs:
@@ -31,8 +34,71 @@ services:
       timeout: 15s
       retries: 3
       start_period: 90s
-    logging:
+    logging: &app_logging
       driver: json-file
       options:
         max-size: 10m
         max-file: "5"
+
+  auth:
+    image: wb-price-bot:${APP_VERSION:-0.3.0}
+    container_name: wb-price-bot-auth
+    command: ["python", "-m", "wb_price_bot", "auth-server"]
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - ${WB_CONFIG_FILE:-.env}
+    environment: *app_environment
+    volumes: *app_volumes
+    tmpfs:
+      - /tmp:size=512m,noexec,nosuid
+    depends_on:
+      bot:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging: *app_logging
+
+  caddy:
+    image: caddy:2.10.2-alpine
+    container_name: wb-price-bot-caddy
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      AUTH_DOMAIN: ${AUTH_DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid
+    depends_on:
+      auth:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "caddy", "validate", "--config", "/etc/caddy/Caddyfile"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging: *app_logging
+
+volumes:
+  caddy_data:
+  caddy_config:

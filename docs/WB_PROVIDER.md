@@ -22,9 +22,12 @@ Telegram-геопозиция передаётся в `user-geo-data.wildberries
 
 ## Аккаунтный режим (beta)
 
-`scripts/capture_wb_session.py` открывает видимый Chrome/Chromium. Пользователь выполняет
-штатный вход WB ID и любые защитные проверки сам. Playwright экспортирует cookies,
-localStorage и IndexedDB в storage state; после импорта он шифруется.
+Основной путь — `/account` в Telegram. Бот создаёт одноразовую Mini App-ссылку; auth-сервис
+запускает изолированный Chromium и передаёт его изображение/управление по защищённому
+WebSocket. Пользователь выполняет штатный вход WB ID и любые защитные проверки сам. После
+Bearer-запроса Playwright экспортирует cookies, localStorage и IndexedDB в storage state,
+после чего он нормализуется, шифруется и сохраняется для этого Telegram ID. Chromium
+уничтожается. `scripts/capture_wb_session.py` остаётся аварийным административным fallback.
 
 На сервере Chromium открывает карточку обычным способом. Адаптер использует ответ страницы
 для метаданных и видимую цену DOM, включая WB Кошелёк, если она действительно показана.

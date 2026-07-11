@@ -7,6 +7,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
+    WebAppInfo,
 )
 
 from .models import Product
@@ -244,6 +245,35 @@ def account_warning_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="Понимаю риск, продолжить", callback_data="account:accept")],
             [InlineKeyboardButton(text="Отмена", callback_data="account:show")],
+        ]
+    )
+
+
+def account_auth_keyboard(url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🌐 Открыть защищённое окно WB",
+                    web_app=WebAppInfo(url=url),
+                )
+            ],
+            [InlineKeyboardButton(text="Отмена", callback_data="account:show")],
+        ]
+    )
+
+
+def access_review_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Разрешить", callback_data=f"access:approve:{telegram_id}"
+                ),
+                InlineKeyboardButton(
+                    text="⛔ Отклонить", callback_data=f"access:block:{telegram_id}"
+                ),
+            ]
         ]
     )
 
