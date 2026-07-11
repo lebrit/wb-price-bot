@@ -24,6 +24,7 @@ def test_browser_extension_manifest_is_scoped_to_wildberries() -> None:
     assert manifest["optional_host_permissions"] == ["https://*/*"]
     assert (root / "extension" / "service-worker.js").is_file()
     assert (root / "extension" / "popup.js").is_file()
+    assert "COPY extension ./extension" in (root / "Dockerfile").read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
