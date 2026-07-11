@@ -12,6 +12,7 @@ from wb_price_bot.database import (
     Database,
     ProductAlreadyExistsError,
     ProductLimitError,
+    auth_pairing_code,
 )
 from wb_price_bot.domain import PriceSnapshot, ThresholdKind, utcnow
 
@@ -97,6 +98,8 @@ async def test_user_approval_and_auth_sessions_are_isolated(settings: Settings) 
     assert await database.approved_telegram_ids(frozenset({1001})) == {1001, 2002}
 
     first = await database.create_auth_session(2002, 600)
+    pairing_code = auth_pairing_code(first.id)
+    assert len(pairing_code) == 10
     assert await database.get_auth_session(first.id, 1001) is None
     assert await database.activate_auth_session(first.id, 1001) is False
     assert await database.queue_auth_session(first.id, 2002) is True
@@ -132,6 +135,19 @@ async def test_user_approval_and_auth_sessions_are_isolated(settings: Settings) 
             approve=False,
             configured_admins=frozenset({9999}),
         )
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_connector_pairing_code_is_one_time_and_user_bound(settings: Settings) -> None:
+    database = Database(settings.database_path)
+    await database.initialize()
+    await database.ensure_user(1001, "owner", "Owner", is_admin=True)
+    auth_session = await database.create_auth_session(1001, 600)
+    code = auth_pairing_code(auth_session.id)
+    assert await database.activate_connector_session("BAD-CODE") is None
+    assert await database.activate_connector_session(code) == (auth_session.id, 1001)
+    assert await database.activate_connector_session(code) is None
     await database.close()
 
 

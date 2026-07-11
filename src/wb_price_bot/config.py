@@ -86,7 +86,6 @@ class Settings:
     auth_bind_host: str = "0.0.0.0"
     auth_port: int = 8080
     auth_session_ttl_seconds: int = 600
-    auth_max_concurrent_sessions: int = 2
     registration_mode: str = "approval"
 
     @property
@@ -144,10 +143,6 @@ class Settings:
         auth_port = _positive_int("AUTH_PORT", 8080, 1)
         if auth_port > 65535:
             raise ConfigurationError("AUTH_PORT должен быть от 1 до 65535")
-        auth_slots = _positive_int("AUTH_MAX_CONCURRENT_SESSIONS", 2, 1)
-        if auth_slots > 10:
-            raise ConfigurationError("AUTH_MAX_CONCURRENT_SESSIONS должен быть от 1 до 10")
-
         return cls(
             telegram_token=token,
             session_encryption_key=encryption_key,
@@ -179,6 +174,5 @@ class Settings:
             auth_bind_host=os.getenv("AUTH_BIND_HOST", "0.0.0.0").strip() or "0.0.0.0",
             auth_port=auth_port,
             auth_session_ttl_seconds=_positive_int("AUTH_SESSION_TTL_SECONDS", 600, 300),
-            auth_max_concurrent_sessions=auth_slots,
             registration_mode=registration_mode,
         )

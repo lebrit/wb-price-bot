@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -10,6 +11,7 @@ import pytest
 from wb_price_bot.config import Settings
 from wb_price_bot.domain import VariantSelection
 from wb_price_bot.wildberries import (
+    AccountWildberriesClient,
     MpstatsPriceClient,
     ProductReferenceError,
     PublicWildberriesClient,
@@ -159,6 +161,39 @@ async def test_short_link_external_redirect_is_rejected(settings: Settings) -> N
 def test_parse_price_text() -> None:
     assert parse_price_text("с WB Кошельком 1 199 ₽") == 119_900
     assert parse_price_text("нет цены") is None
+
+
+@pytest.mark.asyncio
+async def test_account_connector_uses_lightweight_authorized_request(
+    settings: Settings,
+) -> None:
+    seen: httpx.Request | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal seen
+        seen = request
+        return httpx.Response(200, json=_product_payload())
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = AccountWildberriesClient(settings, http)
+    state = {
+        "cookies": [{"name": "wb-session", "value": "cookie-secret", "domain": ".wildberries.ru"}],
+        "origins": [{"origin": "https://www.wildberries.ru", "localStorage": []}],
+        "connector": {
+            "version": 1,
+            "cardUrl": "https://card.wb.ru/cards/v4/detail?appType=1&nm=1",
+            "headers": {"authorization": "Bearer connector-secret-token"},
+            "capturedAt": "2026-07-12T00:00:00Z",
+        },
+    }
+    result = await client.fetch_many([28436956], json.dumps(state))
+    assert result.products[28436956].price == 95_500
+    assert result.products[28436956].source == "account_connector"
+    assert seen is not None
+    assert seen.url.params["nm"] == "28436956"
+    assert seen.headers["authorization"] == "Bearer connector-secret-token"
+    assert "wb-session=cookie-secret" in seen.headers["cookie"]
+    await http.aclose()
 
 
 @pytest.mark.asyncio

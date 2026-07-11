@@ -2,7 +2,7 @@ services:
   bot:
     build:
       context: .
-    image: wb-price-bot:${APP_VERSION:-0.3.2}
+    image: wb-price-bot:${APP_VERSION:-0.4.0}
     container_name: wb-price-bot
     restart: unless-stopped
     init: true
@@ -42,9 +42,10 @@ services:
         max-file: "5"
 
   auth:
-    image: wb-price-bot:${APP_VERSION:-0.3.2}
+    image: wb-price-bot:${APP_VERSION:-0.4.0}
     container_name: wb-price-bot-auth
-    command: ["python", "-m", "wb_price_bot", "auth-server"]
+    entrypoint: ["python", "-m", "wb_price_bot", "auth-server"]
+    command: []
     restart: unless-stopped
     init: true
     user: "10001:10001"
@@ -58,8 +59,7 @@ services:
     environment: *app_environment
     volumes: *app_volumes
     tmpfs:
-      - /tmp:size=512m,noexec,nosuid
-      - /tmp/.X11-unix:mode=1777
+      - /tmp:size=64m,noexec,nosuid
     depends_on:
       bot:
         condition: service_healthy

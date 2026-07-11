@@ -270,7 +270,7 @@ validate_domain() {
 }
 
 write_config() {
-  local ids="$1" interval="$2" destination="$3" domain="$4" registration="$5" slots="$6" tmp
+  local ids="$1" interval="$2" destination="$3" domain="$4" registration="$5" tmp
   tmp="$(mktemp "${CONFIG_DIR}/.config.XXXXXX")"
   cat >"${tmp}" <<EOF
 TELEGRAM_ALLOWED_USERS=${ids//;/,}
@@ -293,7 +293,6 @@ AUTH_PUBLIC_URL=https://${domain}
 AUTH_BIND_HOST=0.0.0.0
 AUTH_PORT=8080
 AUTH_SESSION_TTL_SECONDS=600
-AUTH_MAX_CONCURRENT_SESSIONS=${slots}
 REGISTRATION_MODE=${registration}
 EOF
   chown root:10001 "${tmp}"
@@ -345,7 +344,7 @@ create_session_key() {
 }
 
 configure_first_install() {
-  local token ids interval destination domain registration slots
+  local token ids interval destination domain registration
   if [[ -s "${SECRETS_DIR}/telegram-token" && -s "${CONFIG_FILE}" ]]; then
     return 0
   fi
@@ -357,24 +356,22 @@ configure_first_install() {
   [[ "${interval}" =~ ^[0-9]+$ && "${interval}" -ge 900 ]] || die "неверный интервал"
   read_prompt destination "WB dest региона (Иркутск по умолчанию)" "-5827722"
   [[ "${destination}" =~ ^-?[0-9]+$ ]] || die "WB dest должен быть целым числом"
-  read_prompt domain "Домен для защищённого окна авторизации WB (A/AAAA-запись должна вести на сервер)"
+  read_prompt domain "Домен WB Connector (A/AAAA-запись должна вести на сервер)"
   domain="${domain,,}"
   validate_domain "${domain}" || die "укажите домен вида auth.example.com без https:// и пути"
   read_prompt registration "Режим регистрации: approval, open или allowlist" "approval"
   [[ "${registration}" =~ ^(approval|open|allowlist)$ ]] || die "неверный режим регистрации"
-  read_prompt slots "Одновременных окон авторизации, 1–5" "2"
-  [[ "${slots}" =~ ^[1-5]$ ]] || die "количество окон должно быть от 1 до 5"
   printf '%s\n' "${token}" >"${SECRETS_DIR}/telegram-token"
   chown root:10001 "${SECRETS_DIR}/telegram-token"
   chmod 640 "${SECRETS_DIR}/telegram-token"
-  write_config "${ids}" "${interval}" "${destination}" "${domain}" "${registration}" "${slots}"
+  write_config "${ids}" "${interval}" "${destination}" "${domain}" "${registration}"
 }
 
 ensure_auth_config() {
-  local domain public_url registration slots
+  local domain public_url registration
   domain="$(read_config_value AUTH_DOMAIN || true)"
   if [[ -z "${domain}" || "${domain}" == "localhost" ]] || ! validate_domain "${domain}"; then
-    read_prompt domain "Домен для защищённого окна авторизации WB"
+    read_prompt domain "Домен WB Connector"
     domain="${domain,,}"
     validate_domain "${domain}" || die "укажите домен вида auth.example.com"
     set_config_value AUTH_DOMAIN "${domain}"
@@ -385,10 +382,6 @@ ensure_auth_config() {
   registration="$(read_config_value REGISTRATION_MODE || true)"
   if [[ ! "${registration}" =~ ^(approval|open|allowlist)$ ]]; then
     set_config_value REGISTRATION_MODE approval
-  fi
-  slots="$(read_config_value AUTH_MAX_CONCURRENT_SESSIONS || true)"
-  if [[ ! "${slots}" =~ ^[1-5]$ ]]; then
-    set_config_value AUTH_MAX_CONCURRENT_SESSIONS 2
   fi
   [[ -n "$(read_config_value AUTH_BIND_HOST || true)" ]] || set_config_value AUTH_BIND_HOST 0.0.0.0
   [[ -n "$(read_config_value AUTH_PORT || true)" ]] || set_config_value AUTH_PORT 8080
@@ -651,7 +644,7 @@ wb_session_menu() {
   while true; do
     say
     say "Аккаунт Wildberries (beta)"
-    say "1) Показать инструкцию безопасного входа"
+    say "1) Показать инструкцию WB Connector"
     say "2) Импортировать wb-session.json с сервера"
     say "3) Удалить WB-сессию"
     say "4) Проверить публичную карточку WB"
@@ -659,12 +652,11 @@ wb_session_menu() {
     read_prompt choice "Выберите пункт"
     case "${choice}" in
       1)
-        say "На компьютере из каталога проекта выполните:"
-        say "  python -m pip install '.[browser]'"
-        say "  python -m playwright install chromium"
-        say "  python scripts/capture_wb_session.py"
-        say "Не отправляйте файл боту. Импортируйте прямо по SSH/stdin:"
-        say "  ssh USER@SERVER 'sudo wb-price-bot wb-session-import TELEGRAM_ID' < wb-session.json"
+        say "Откройте в Telegram: /account → Подключить / обновить."
+        say "Бот выдаст одноразовый код и ссылку на расширение Chrome/Edge."
+        say "Войдите на wildberries.ru обычным способом и введите код в расширении."
+        say "Телефон и SMS-код серверу не передаются."
+        say "Скачать расширение: https://$(read_config_value AUTH_DOMAIN)/extension/wb-price-bot-connector.zip"
         ;;
       2)
         read_prompt telegram_id "Telegram ID владельца сессии" "$(read_config_value TELEGRAM_ALLOWED_USERS | cut -d, -f1)"
@@ -777,15 +769,13 @@ web_auth_menu() {
   local choice value
   while true; do
     say
-    say "Web-авторизация и пользователи"
+    say "WB Connector и пользователи"
     say "Домен: $(read_config_value AUTH_DOMAIN)"
     say "Регистрация: $(read_config_value REGISTRATION_MODE)"
-    say "Одновременных окон: $(read_config_value AUTH_MAX_CONCURRENT_SESSIONS)"
     say "1) Изменить домен"
     say "2) Изменить режим регистрации"
-    say "3) Изменить число браузерных окон"
-    say "4) Проверить HTTPS и auth-сервис"
-    say "5) Перезапустить web-авторизацию"
+    say "3) Проверить HTTPS и Connector API"
+    say "4) Перезапустить Connector API"
     say "0) Назад"
     read_prompt choice "Выберите пункт"
     case "${choice}" in
@@ -806,24 +796,17 @@ web_auth_menu() {
         wait_healthy 240 || warn "bot/auth ещё не healthy"
         ;;
       3)
-        read_prompt value "Одновременных окон, 1–5" "$(read_config_value AUTH_MAX_CONCURRENT_SESSIONS)"
-        [[ "${value}" =~ ^[1-5]$ ]] || { warn "нужно число от 1 до 5"; continue; }
-        set_config_value AUTH_MAX_CONCURRENT_SESSIONS "${value}"
-        compose_current up -d --force-recreate auth
-        wait_healthy 240 || warn "auth-сервис ещё не healthy"
-        ;;
-      4)
         value="$(read_config_value AUTH_DOMAIN)"
         if curl -fsS --max-time 20 "https://${value}/health"; then
           say
-          say "HTTPS и auth-сервис: OK"
+          say "HTTPS и Connector API: OK"
         else
           warn "проверка не прошла; проверьте DNS домена, доступность 80/443 и журнал Caddy"
         fi
         ;;
-      5)
+      4)
         compose_current restart auth caddy
-        wait_healthy 240 || warn "web-авторизация ещё не healthy"
+        wait_healthy 240 || warn "WB Connector ещё не healthy"
         ;;
       0) return ;;
       *) warn "неизвестный пункт" ;;
@@ -932,9 +915,9 @@ doctor() {
     warn "Telegram getMe: ошибка"
   fi
   if curl -fsS --max-time 20 "$(read_config_value AUTH_PUBLIC_URL)/health" >/dev/null; then
-    say "Web-авторизация HTTPS: OK"
+    say "WB Connector HTTPS: OK"
   else
-    warn "Web-авторизация HTTPS: ошибка"
+    warn "WB Connector HTTPS: ошибка"
   fi
 }
 
@@ -1032,7 +1015,7 @@ command_menu() {
     say "8) Аккаунт Wildberries"
     say "9) Настройки мониторинга"
     say "10) Лицензированный источник MPSTATS"
-    say "11) Web-авторизация и пользователи"
+    say "11) WB Connector и пользователи"
     say "12) Резервные копии"
     say "13) Диагностика"
     say "14) Удаление"

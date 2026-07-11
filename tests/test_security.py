@@ -72,3 +72,48 @@ def test_legacy_cookie_can_be_normalized_only_when_explicitly_allowed() -> None:
 def test_cookie_header_injection_is_rejected() -> None:
     with pytest.raises(SessionFormatError):
         normalize_wb_session("name=value\r\nX-Evil: yes", require_auth_marker=False)
+
+
+def test_connector_metadata_is_filtered_and_can_be_required() -> None:
+    raw = json.dumps(
+        {
+            "cookies": [{"name": "session", "value": "value", "domain": ".wildberries.ru"}],
+            "origins": [
+                {
+                    "origin": "https://www.wildberries.ru",
+                    "localStorage": [{"name": "token", "value": "opaque"}],
+                }
+            ],
+            "connector": {
+                "version": 1,
+                "cardUrl": "https://card.wb.ru/cards/v4/detail?nm=1",
+                "headers": {
+                    "authorization": "Bearer connector-secret-token",
+                    "x-userid": "123",
+                    "evil-header": "leak",
+                },
+                "capturedAt": "2026-07-12T00:00:00Z",
+            },
+        }
+    )
+    normalized = json.loads(normalize_wb_session(raw, require_connector=True))
+    assert normalized["connector"]["headers"] == {
+        "authorization": "Bearer connector-secret-token",
+        "x-userid": "123",
+    }
+
+
+def test_connector_rejects_non_wb_card_url() -> None:
+    raw = json.dumps(
+        {
+            "cookies": [{"name": "session", "value": "value", "domain": ".wildberries.ru"}],
+            "origins": [{"origin": "https://www.wildberries.ru", "localStorage": []}],
+            "connector": {
+                "version": 1,
+                "cardUrl": "https://evil.example/cards/v4/detail",
+                "headers": {"authorization": "Bearer connector-secret-token"},
+            },
+        }
+    )
+    with pytest.raises(SessionFormatError, match="безопасный адрес"):
+        normalize_wb_session(raw, require_connector=True)

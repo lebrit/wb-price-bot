@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import secrets
 import sqlite3
 from collections import defaultdict
@@ -47,6 +48,16 @@ class ProductAlreadyExistsError(RuntimeError):
 
 class ProductLimitError(RuntimeError):
     pass
+
+
+_PAIRING_CODE_RE = re.compile(r"^[A-F0-9]{10}$")
+
+
+def auth_pairing_code(session_id: str) -> str:
+    prefix, separator, _ = session_id.partition("-")
+    if not separator or not _PAIRING_CODE_RE.fullmatch(prefix.upper()):
+        raise ValueError("Сессия не поддерживает код подключения")
+    return prefix.upper()
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,7 +330,7 @@ class Database:
                 item.status = "cancelled"
                 item.last_error = "Создано новое окно авторизации"
             auth_session = AuthSession(
-                id=secrets.token_urlsafe(32),
+                id=f"{secrets.token_hex(5)}-{secrets.token_urlsafe(32)}",
                 user_id=user.id,
                 status="pending",
                 expires_at=utcnow() + timedelta(seconds=ttl_seconds),
@@ -327,6 +338,48 @@ class Database:
             session.add(auth_session)
             await session.flush()
             return auth_session
+
+    async def activate_connector_session(self, pairing_code: str) -> tuple[str, int] | None:
+        code = pairing_code.strip().upper()
+        if not _PAIRING_CODE_RE.fullmatch(code):
+            return None
+        prefix = f"{code.lower()}-%"
+        async with self._sessions() as session, session.begin():
+            now = utcnow()
+            row = (
+                await session.execute(
+                    select(AuthSession, User.telegram_id)
+                    .join(User, AuthSession.user_id == User.id)
+                    .where(
+                        AuthSession.id.like(prefix),
+                        AuthSession.status == "pending",
+                        AuthSession.expires_at > now,
+                        User.access_status == "approved",
+                        User.is_enabled.is_(True),
+                    )
+                    .limit(1)
+                )
+            ).first()
+            if row is None:
+                await session.execute(
+                    update(AuthSession)
+                    .where(
+                        AuthSession.id.like(prefix),
+                        AuthSession.status == "pending",
+                        AuthSession.expires_at <= now,
+                    )
+                    .values(status="expired", last_error="Срок действия кода подключения истёк")
+                )
+                return None
+            auth_session, telegram_id = row
+            result = await session.execute(
+                update(AuthSession)
+                .where(AuthSession.id == auth_session.id, AuthSession.status == "pending")
+                .values(status="active", last_error=None)
+            )
+            if int(result.rowcount or 0) != 1:  # type: ignore[attr-defined]
+                return None
+            return auth_session.id, int(telegram_id)
 
     async def get_auth_session(
         self, session_id: str, telegram_id: int | None = None

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
@@ -12,6 +13,17 @@ from wb_price_bot.domain import ThresholdKind, utcnow
 from wb_price_bot.exports import export_products
 
 from .conftest import make_snapshot
+
+
+def test_browser_extension_manifest_is_scoped_to_wildberries() -> None:
+    root = Path(__file__).resolve().parents[1]
+    manifest = json.loads((root / "extension" / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["manifest_version"] == 3
+    assert manifest["version"] == "0.4.0"
+    assert "<all_urls>" not in manifest["host_permissions"]
+    assert manifest["optional_host_permissions"] == ["https://*/*"]
+    assert (root / "extension" / "service-worker.js").is_file()
+    assert (root / "extension" / "popup.js").is_file()
 
 
 @pytest.mark.asyncio

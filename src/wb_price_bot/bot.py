@@ -86,6 +86,7 @@ async def run_bot(settings: Settings) -> None:
         except TimeoutError:
             monitor_task.cancel()
         await public_client.close()
+        await account_client.close()
         await licensed_client.close()
         await bot.session.close()
         await database.close()

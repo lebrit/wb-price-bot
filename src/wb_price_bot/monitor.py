@@ -458,6 +458,7 @@ def source_label(source: str) -> str:
         "public_api": "публичная цена",
         "account_browser": "цена аккаунта (beta)",
         "account_browser_wallet": "цена аккаунта с WB Кошельком (beta)",
+        "account_connector": "персональная цена через WB Connector (beta)",
         "context_reset": "ожидает новой контрольной цены",
         "licensed_mpstats": "лицензированный fallback MPSTATS",
     }
