@@ -45,3 +45,7 @@ jobs:
           caddy:2.10.2-alpine caddy validate --config /etc/caddy/Caddyfile
       - name: Build image
         run: docker build -t wb-price-bot:ci .
+      - name: Smoke test container entrypoint
+        run: >-
+          docker run --rm wb-price-bot:ci
+          python -m wb_price_bot version | grep -Fx 0.3.1
