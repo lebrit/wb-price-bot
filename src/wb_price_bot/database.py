@@ -137,6 +137,15 @@ class DatabaseStats:
     alerts_pending: int
 
 
+@dataclass(frozen=True, slots=True)
+class AdminAccessStats:
+    users_pending: int
+    users_approved: int
+    users_blocked: int
+    auth_pending: int
+    auth_active: int
+
+
 class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -1213,6 +1222,28 @@ class Database:
             )
             cycle = datetime.fromisoformat(raw_cycle) if raw_cycle else None
             return DatabaseStats(total, active, users, cycle, pending)
+
+    async def admin_access_stats(self) -> AdminAccessStats:
+        async with self._sessions() as session:
+            user_rows = (
+                await session.execute(
+                    select(User.access_status, func.count()).group_by(User.access_status)
+                )
+            ).all()
+            auth_rows = (
+                await session.execute(
+                    select(AuthSession.status, func.count()).group_by(AuthSession.status)
+                )
+            ).all()
+        users = {str(status): int(count) for status, count in user_rows}
+        auth = {str(status): int(count) for status, count in auth_rows}
+        return AdminAccessStats(
+            users_pending=users.get("pending", 0),
+            users_approved=users.get("approved", 0),
+            users_blocked=users.get("blocked", 0),
+            auth_pending=auth.get("pending", 0) + auth.get("queued", 0),
+            auth_active=auth.get("active", 0),
+        )
 
     async def prune_history(self, days: int) -> int:
         cutoff = utcnow() - timedelta(days=days)

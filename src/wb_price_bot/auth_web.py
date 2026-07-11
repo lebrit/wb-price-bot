@@ -183,11 +183,14 @@ class AuthWebService:
             logger.exception("Ошибка web-авторизации WB: %s", type(exc).__name__)
             await self.database.set_auth_session_status(
                 session_id,
-                "failed",
-                f"Внутренняя ошибка: {type(exc).__name__}",
-                expected_statuses=("pending", "queued", "active"),
+                "pending",
+                f"Браузер можно открыть повторно: {type(exc).__name__}",
+                expected_statuses=("queued", "active"),
             )
-            await _send_error(ws, "Не удалось открыть защищённый браузер")
+            await _send_error(
+                ws,
+                "Не удалось открыть защищённый браузер. Закройте окно и откройте эту кнопку снова.",
+            )
         finally:
             current = await self.database.get_auth_session(session_id)
             if current is not None and current.status in {"active", "queued"}:
@@ -196,8 +199,8 @@ class AuthWebService:
                     session_id,
                     "expired"
                     if current_expires is not None and current_expires <= _utcnow()
-                    else "cancelled",
-                    "Окно браузера закрыто",
+                    else "pending",
+                    "Соединение закрыто; окно можно открыть повторно",
                     expected_statuses=("active", "queued"),
                 )
             async with self._active_lock:
@@ -214,6 +217,7 @@ class AuthWebService:
         expires_at: datetime,
     ) -> None:
         try:
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
             from playwright.async_api import async_playwright
         except ImportError as exc:
             raise RuntimeError("Playwright не установлен") from exc
@@ -276,17 +280,42 @@ class AuthWebService:
                     task.add_done_callback(inspection_tasks.discard)
 
                 page.on("response", on_response)
-                await page.goto(_WB_HOME, wait_until="domcontentloaded", timeout=60_000)
-                await ws.send_json(
-                    {
-                        "type": "status",
-                        "text": "Откройте вход в Wildberries, введите телефон и код, затем нажмите «Сохранить вход».",
-                    }
-                )
+                await page.set_content(_browser_placeholder("Запускаю страницу Wildberries…"))
                 frame_task = asyncio.create_task(
                     self._stream_frames(page, ws, session_id, telegram_id)
                 )
+
+                async def open_wildberries() -> bool:
+                    await ws.send_json({"type": "status", "text": "Подключаюсь к Wildberries…"})
+                    try:
+                        await page.goto(_WB_HOME, wait_until="commit", timeout=25_000)
+                    except PlaywrightTimeoutError:
+                        with contextlib.suppress(Exception):
+                            await page.evaluate("window.stop()")
+                        with contextlib.suppress(Exception):
+                            await page.set_content(
+                                _browser_placeholder(
+                                    "Wildberries не ответил. Нажмите ↻ для повторной попытки."
+                                )
+                            )
+                        await _send_error(
+                            ws,
+                            "Wildberries не ответил вовремя. Нажмите ↻ для повторной попытки.",
+                            fatal=False,
+                        )
+                        return False
+                    with contextlib.suppress(PlaywrightTimeoutError):
+                        await page.wait_for_load_state("domcontentloaded", timeout=5_000)
+                    await ws.send_json(
+                        {
+                            "type": "status",
+                            "text": "Откройте вход в Wildberries, введите телефон и код, затем нажмите «Сохранить вход».",
+                        }
+                    )
+                    return True
+
                 try:
+                    await open_wildberries()
                     while not ws.closed:
                         remaining = max(0.0, (expires_at - _utcnow()).total_seconds())
                         if remaining <= 0:
@@ -306,13 +335,16 @@ class AuthWebService:
                             if current is None or current.status != "active":
                                 await _send_error(ws, "Это окно входа отменено или заменено новым")
                                 return
+                            if action == "reload":
+                                await open_wildberries()
+                                continue
                             if action == "complete":
                                 await ws.send_json(
                                     {"type": "status", "text": "Проверяю вход Wildberries…"}
                                 )
-                                await page.goto(
-                                    _WB_HOME, wait_until="domcontentloaded", timeout=60_000
-                                )
+                                if not auth_seen.is_set():
+                                    with contextlib.suppress(PlaywrightTimeoutError):
+                                        await page.reload(wait_until="commit", timeout=20_000)
                                 with contextlib.suppress(TimeoutError):
                                     await asyncio.wait_for(auth_seen.wait(), timeout=12)
                                 if not auth_seen.is_set():
@@ -530,6 +562,23 @@ def _utcnow() -> datetime:
     from .domain import utcnow
 
     return utcnow()
+
+
+def _browser_placeholder(message: str) -> str:
+    safe_message = html.escape(message)
+    return f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    html,body {{ height:100%; margin:0; }}
+    body {{ display:grid; place-items:center; padding:24px; box-sizing:border-box;
+            background:#fff; color:#475569; font:16px system-ui,sans-serif; text-align:center; }}
+  </style>
+</head>
+<body>{safe_message}</body>
+</html>"""
 
 
 def _login_html(session_id: str, nonce: str) -> str:

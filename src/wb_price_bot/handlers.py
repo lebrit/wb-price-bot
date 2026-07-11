@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import html
 import json
@@ -13,6 +14,7 @@ from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message, TelegramObject
+from aiohttp import ClientSession, ClientTimeout
 
 from .config import Settings
 from .database import Database, ProductAlreadyExistsError, ProductLimitError
@@ -32,6 +34,7 @@ from .keyboards import (
     account_delete_confirmation,
     account_keyboard,
     account_warning_keyboard,
+    admin_keyboard,
     delete_confirmation,
     main_keyboard,
     product_keyboard,
@@ -41,6 +44,7 @@ from .keyboards import (
 )
 from .monitor import PriceMonitor, seconds_since, source_label
 from .security import SessionCipher
+from .server_stats import collect_server_stats, format_bytes, format_duration
 from .wildberries import (
     AccountSessionError,
     AccountWildberriesClient,
@@ -132,6 +136,12 @@ def create_router(context: HandlerContext) -> Router:
     router.message.middleware(access)
     router.callback_query.middleware(access)
 
+    def is_admin(telegram_id: int) -> bool:
+        return telegram_id in context.settings.allowed_users
+
+    def menu_for(telegram_id: int) -> Any:
+        return main_keyboard(is_admin=is_admin(telegram_id))
+
     @router.message(CommandStart())
     async def start(message: Message, state: FSMContext) -> None:
         await state.clear()
@@ -181,7 +191,7 @@ def create_router(context: HandlerContext) -> Router:
             "или целевую цену — и бот будет проверять товар в фоне.\n\n"
             "Цена зависит от региона, размера, способа оплаты и аккаунта. "
             "Источник всегда указан в карточке и уведомлении.",
-            reply_markup=main_keyboard(),
+            reply_markup=menu_for(user.id),
         )
 
     @router.callback_query(F.data.startswith("access:"))
@@ -238,6 +248,9 @@ def create_router(context: HandlerContext) -> Router:
         if status is None:
             await message.answer("Использование: <code>/users pending|approved|blocked</code>")
             return
+        await send_user_list(message, status)
+
+    async def send_user_list(message: Message, status: str) -> None:
         users = await context.database.users_by_access_status(status, limit=50)
         if not users:
             await message.answer(f"👥 Пользователей со статусом {status} нет.")
@@ -258,17 +271,121 @@ def create_router(context: HandlerContext) -> Router:
                 reply_markup=access_review_keyboard(item.telegram_id),
             )
 
+    async def service_health(url: str) -> dict[str, Any] | None:
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=3)) as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        return None
+                    payload: Any = await response.json()
+                    return payload if isinstance(payload, dict) else None
+        except Exception:
+            return None
+
+    async def admin_dashboard() -> str:
+        public_health_url = f"{context.settings.auth_public_url}/health"
+        server, database, access_stats, auth_health, public_health = await asyncio.gather(
+            collect_server_stats(context.settings.data_dir),
+            context.database.stats(),
+            context.database.admin_access_stats(),
+            service_health(f"http://auth:{context.settings.auth_port}/health"),
+            service_health(public_health_url),
+        )
+        memory_used = max(0, server.memory_total - server.memory_available)
+        disk_used = max(0, server.disk_total - server.disk_free)
+        memory_percent = memory_used * 100 / server.memory_total if server.memory_total else 0.0
+        disk_percent = disk_used * 100 / server.disk_total if server.disk_total else 0.0
+        cpu = "—" if server.cpu_percent is None else f"{server.cpu_percent:.1f}%"
+        loads = (
+            "—"
+            if server.load_1 is None
+            else f"{server.load_1:.2f} / {server.load_5:.2f} / {server.load_15:.2f}"
+        )
+        swap = (
+            "выключен"
+            if not server.swap_total
+            else f"{format_bytes(server.swap_total - server.swap_free)} / "
+            f"{format_bytes(server.swap_total)}"
+        )
+        cycle_age = seconds_since(database.last_monitor_cycle)
+        cycle = "ещё не было" if cycle_age is None else f"{cycle_age} сек. назад"
+        auth_ok = bool(auth_health and auth_health.get("ok"))
+        auth_slots = (
+            f"{auth_health.get('active', 0)}/{auth_health.get('limit', '—')}"
+            if auth_health
+            else "недоступен"
+        )
+        return (
+            "🛠 <b>Админ-панель</b>\n\n"
+            "🖥 <b>Сервер</b>\n"
+            f"CPU: <b>{cpu}</b> · {server.cpu_count} ядер\n"
+            f"Load 1/5/15: {loads}\n"
+            f"RAM: {format_bytes(memory_used)} / {format_bytes(server.memory_total)} "
+            f"({memory_percent:.1f}%)\n"
+            f"Swap: {swap}\n"
+            f"Диск: {format_bytes(disk_used)} / {format_bytes(server.disk_total)} "
+            f"({disk_percent:.1f}%, свободно {format_bytes(server.disk_free)})\n"
+            f"Uptime: {format_duration(server.uptime_seconds)}\n"
+            f"Память процесса бота: {format_bytes(server.process_rss)}\n\n"
+            "⚙️ <b>Сервисы</b>\n"
+            "Bot: 🟢 работает\n"
+            f"Auth: {'🟢' if auth_ok else '🔴'} {auth_slots}\n"
+            f"HTTPS: {'🟢 доступен' if public_health else '🔴 недоступен'}\n"
+            f"Последняя проверка цен: {cycle}\n\n"
+            "📊 <b>Данные</b>\n"
+            f"Пользователи: {database.users_total} · заявок {access_stats.users_pending} · "
+            f"активных {access_stats.users_approved} · заблокировано {access_stats.users_blocked}\n"
+            f"Товары: {database.products_active} активных / {database.products_total} всего\n"
+            f"Уведомления в очереди: {database.alerts_pending}\n"
+            f"Окна входа WB: {access_stats.auth_active} активных · "
+            f"{access_stats.auth_pending} ожидают"
+        )
+
+    async def show_admin(message: Message) -> None:
+        if message.from_user is None or not is_admin(message.from_user.id):
+            await message.answer("Команда доступна администратору.")
+            return
+        await message.answer(await admin_dashboard(), reply_markup=admin_keyboard())
+
+    router.message.register(show_admin, Command("admin"))
+    router.message.register(show_admin, F.text == "🛠 Админ-панель")
+
+    @router.callback_query(F.data == "admin:stats")
+    async def refresh_admin(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id):
+            await callback.answer("Только для администратора", show_alert=True)
+            return
+        if isinstance(callback.message, Message):
+            await callback.message.edit_text(await admin_dashboard(), reply_markup=admin_keyboard())
+        await callback.answer("Статистика обновлена")
+
+    @router.callback_query(F.data.in_({"admin:pending", "admin:approved", "admin:blocked"}))
+    async def admin_user_list(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id):
+            await callback.answer("Только для администратора", show_alert=True)
+            return
+        status = str(callback.data).split(":", 1)[1]
+        if isinstance(callback.message, Message):
+            await send_user_list(callback.message, status)
+        await callback.answer()
+
     @router.message(Command("cancel"))
     async def cancel_command(message: Message, state: FSMContext) -> None:
         await state.clear()
-        await message.answer("Действие отменено.", reply_markup=main_keyboard())
+        actor = message.from_user
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=menu_for(actor.id) if actor is not None else main_keyboard(),
+        )
 
     @router.callback_query(F.data == "cancel")
     async def cancel_callback(callback: CallbackQuery, state: FSMContext) -> None:
         await state.clear()
         await callback.answer("Отменено")
         if isinstance(callback.message, Message):
-            await callback.message.answer("Действие отменено.", reply_markup=main_keyboard())
+            await callback.message.answer(
+                "Действие отменено.", reply_markup=menu_for(callback.from_user.id)
+            )
 
     async def begin_add(target: Message | CallbackQuery, state: FSMContext) -> None:
         await state.set_state(AddProductStates.waiting_reference)
@@ -413,7 +530,7 @@ def create_router(context: HandlerContext) -> Router:
             return
         except (ProductAlreadyExistsError, ProductLimitError) as exc:
             await state.clear()
-            await message.answer(str(exc), reply_markup=main_keyboard())
+            await message.answer(str(exc), reply_markup=menu_for(message.from_user.id))
             return
         await state.clear()
         await message.answer(
@@ -423,7 +540,7 @@ def create_router(context: HandlerContext) -> Router:
             f"Условие: {_threshold_label(product.threshold_kind, product.threshold_value)}\n"
             f"Следующая фоновая проверка — не позднее чем через "
             f"{context.settings.check_interval_seconds // 60} мин.",
-            reply_markup=main_keyboard(),
+            reply_markup=menu_for(message.from_user.id),
         )
 
     async def show_products(target: Message | CallbackQuery, page: int = 0) -> None:
@@ -446,7 +563,7 @@ def create_router(context: HandlerContext) -> Router:
             text = f"📦 <b>Ваши товары</b>\nВсего: {total}. На этой странице активно: {active}."
             markup = products_keyboard(products, page, total, _PRODUCTS_PER_PAGE)
         if isinstance(target, Message):
-            await target.answer(text, reply_markup=markup or main_keyboard())
+            await target.answer(text, reply_markup=markup or menu_for(user.id))
         elif isinstance(target.message, Message):
             await target.message.edit_text(text, reply_markup=markup)
             await target.answer()
@@ -714,6 +831,7 @@ def create_router(context: HandlerContext) -> Router:
             "/export — экспорт CSV/JSON\n"
             "/folders — папки и теги\n"
             "/users pending|approved|blocked — пользователи (админ)\n"
+            "/admin — нагрузка сервера и статистика (админ)\n"
             "/status — состояние сервиса\n"
             "/cancel — отменить текущий ввод\n\n"
             "Бот уведомляет о суммарном падении от контрольной цены. После уведомления "
@@ -728,7 +846,10 @@ def create_router(context: HandlerContext) -> Router:
     @router.message(StateFilter(None))
     async def unknown(message: Message) -> None:
         await message.answer(
-            "Не понял команду. Выберите действие в меню.", reply_markup=main_keyboard()
+            "Не понял команду. Выберите действие в меню.",
+            reply_markup=(
+                menu_for(message.from_user.id) if message.from_user is not None else main_keyboard()
+            ),
         )
 
     return router

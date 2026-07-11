@@ -13,15 +13,31 @@ from aiogram.types import (
 from .models import Product
 
 
-def main_keyboard() -> ReplyKeyboardMarkup:
+def main_keyboard(*, is_admin: bool = False) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text="➕ Добавить товар"), KeyboardButton(text="📦 Мои товары")],
+        [KeyboardButton(text="👤 Аккаунт WB"), KeyboardButton(text="🩺 Статус")],
+        [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="❓ Помощь")],
+    ]
+    if is_admin:
+        rows.append([KeyboardButton(text="🛠 Админ-панель")])
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="➕ Добавить товар"), KeyboardButton(text="📦 Мои товары")],
-            [KeyboardButton(text="👤 Аккаунт WB"), KeyboardButton(text="🩺 Статус")],
-            [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="❓ Помощь")],
-        ],
+        keyboard=rows,
         resize_keyboard=True,
         input_field_placeholder="Выберите действие",
+    )
+
+
+def admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить статистику", callback_data="admin:stats")],
+            [
+                InlineKeyboardButton(text="⏳ Заявки", callback_data="admin:pending"),
+                InlineKeyboardButton(text="✅ Активные", callback_data="admin:approved"),
+            ],
+            [InlineKeyboardButton(text="⛔ Заблокированные", callback_data="admin:blocked")],
+        ]
     )
 
 

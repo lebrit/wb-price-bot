@@ -61,10 +61,16 @@ class BulkStates(StatesGroup):
 
 
 def register_feature_handlers(router: Router, context: Any) -> None:
+    def menu_for(message: Message) -> Any:
+        actor = message.from_user
+        return main_keyboard(
+            is_admin=actor is not None and actor.id in context.settings.allowed_users
+        )
+
     @router.message(StateFilter("*"), F.text == "Отмена")
     async def cancel_feature(message: Message, state: FSMContext) -> None:
         await state.clear()
-        await message.answer("Отменено.", reply_markup=main_keyboard())
+        await message.answer("Отменено.", reply_markup=menu_for(message))
 
     async def show_settings(target: Message | CallbackQuery) -> None:
         actor = target.from_user
@@ -128,7 +134,7 @@ def register_feature_handlers(router: Router, context: Any) -> None:
         await message.answer(
             f"✅ Регион WB обновлён: <code>{region.destination}</code>. "
             "Первая цена нового региона станет новой контрольной.",
-            reply_markup=main_keyboard(),
+            reply_markup=menu_for(message),
         )
 
     @router.callback_query(F.data == "settings:quiet")
@@ -157,7 +163,7 @@ def register_feature_handlers(router: Router, context: Any) -> None:
                 return
         await context.database.set_quiet_hours(message.from_user.id, start, end)
         await state.clear()
-        await message.answer("✅ Тихие часы сохранены.", reply_markup=main_keyboard())
+        await message.answer("✅ Тихие часы сохранены.", reply_markup=menu_for(message))
 
     @router.callback_query(F.data == "settings:digest_toggle")
     async def toggle_digest(callback: CallbackQuery) -> None:
@@ -189,7 +195,7 @@ def register_feature_handlers(router: Router, context: Any) -> None:
             return
         await context.database.set_digest(message.from_user.id, enabled=True, minute=minute)
         await state.clear()
-        await message.answer("✅ Время дневной сводки сохранено.", reply_markup=main_keyboard())
+        await message.answer("✅ Время дневной сводки сохранено.", reply_markup=menu_for(message))
 
     @router.callback_query(F.data.startswith("charts:"))
     async def show_charts(callback: CallbackQuery) -> None:
@@ -435,7 +441,7 @@ def register_feature_handlers(router: Router, context: Any) -> None:
             tags=tags,
         )
         await state.clear()
-        await message.answer("✅ Папка и теги сохранены.", reply_markup=main_keyboard())
+        await message.answer("✅ Папка и теги сохранены.", reply_markup=menu_for(message))
 
     @router.message(Command("folders"))
     async def folders(message: Message) -> None:

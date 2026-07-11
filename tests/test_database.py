@@ -83,6 +83,9 @@ async def test_user_approval_and_auth_sessions_are_isolated(settings: Settings) 
     )
     assert pending.access_status == "pending"
     assert await database.approved_telegram_ids(frozenset({1001})) == {1001}
+    access_stats = await database.admin_access_stats()
+    assert access_stats.users_pending == 1
+    assert access_stats.users_approved == 1
 
     reviewed = await database.review_user_access(
         1001,
@@ -98,6 +101,8 @@ async def test_user_approval_and_auth_sessions_are_isolated(settings: Settings) 
     assert await database.activate_auth_session(first.id, 1001) is False
     assert await database.queue_auth_session(first.id, 2002) is True
     assert await database.activate_auth_session(first.id, 2002) is True
+    access_stats = await database.admin_access_stats()
+    assert access_stats.auth_active == 1
     second = await database.create_auth_session(2002, 600)
     cancelled = await database.get_auth_session(first.id, 2002)
     assert cancelled is not None and cancelled.status == "cancelled"
