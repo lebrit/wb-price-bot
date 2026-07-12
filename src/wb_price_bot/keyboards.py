@@ -7,6 +7,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
+    WebAppInfo,
 )
 
 from .models import Product
@@ -264,16 +265,15 @@ def account_warning_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def account_connector_keyboard(guide_url: str, extension_url: str) -> InlineKeyboardMarkup:
+def account_auth_keyboard(url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="📖 Открыть инструкцию и код",
-                    url=guide_url,
+                    text="🌐 Войти в Wildberries",
+                    web_app=WebAppInfo(url=url),
                 )
             ],
-            [InlineKeyboardButton(text="🧩 Скачать расширение", url=extension_url)],
             [InlineKeyboardButton(text="Отмена", callback_data="account:show")],
         ]
     )

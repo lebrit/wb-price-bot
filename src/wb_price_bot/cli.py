@@ -25,7 +25,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="wb-price-bot")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("run", help="Запустить Telegram-бота")
-    subparsers.add_parser("auth-server", help="Запустить WB Connector API")
+    subparsers.add_parser("auth-server", help="Запустить Telegram-форму входа WB")
     subparsers.add_parser("healthcheck", help="Проверить процесс и SQLite")
     subparsers.add_parser("integrity-check", help="Запустить PRAGMA integrity_check")
     subparsers.add_parser("stats", help="Показать статистику")

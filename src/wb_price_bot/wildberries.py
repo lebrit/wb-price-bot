@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 _CARD_PATH_FRAGMENT = "/cards/v4/detail"
 _PRICE_TEXT_RE = re.compile(r"(\d[\d\s\u00a0]{0,15})\s*[₽р]", re.IGNORECASE)
-_PUBLIC_USER_AGENT = "WB-Price-Bot/0.4 (+https://github.com/lebrit/wb-price-bot)"
+_PUBLIC_USER_AGENT = "WB-Price-Bot/0.5 (+https://github.com/lebrit/wb-price-bot)"
 _CONNECTOR_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
@@ -564,19 +564,15 @@ class AccountWildberriesClient:
         if not unique_ids:
             return FetchResult({})
         if isinstance(storage_state.get("connector"), dict):
-            try:
-                return await self._fetch_connector(unique_ids, storage_state)
-            except AccountSessionError:
-                raise
-            except AccountProviderError as exc:
-                logger.warning(
-                    "Лёгкая проверка WB Connector недоступна, использую браузер: %s", exc
-                )
+            # New account sessions always include a captured card request. Do not launch
+            # Chromium on a transient API failure: the next monitor cycle will retry the
+            # lightweight request and the small VPS remains responsive.
+            return await self._fetch_connector(unique_ids, storage_state)
         try:
             from playwright.async_api import async_playwright
         except ImportError as exc:
             raise AccountProviderError(
-                "WB Connector временно недоступен, а резервный Playwright не установлен"
+                "Для старой WB-сессии недоступен резервный Playwright"
             ) from exc
         browser_state = {
             "cookies": storage_state["cookies"],
@@ -652,15 +648,15 @@ class AccountWildberriesClient:
     ) -> FetchResult:
         connector = storage_state.get("connector")
         if not isinstance(connector, dict):
-            raise AccountProviderError("В сессии нет данных WB Connector")
+            raise AccountProviderError("В сессии нет данных лёгкой проверки WB")
         raw_url = connector.get("cardUrl")
         raw_headers = connector.get("headers")
         if not isinstance(raw_url, str) or not isinstance(raw_headers, dict):
-            raise AccountSessionError("Сессия WB Connector повреждена")
+            raise AccountSessionError("Персональная WB-сессия повреждена")
         try:
             url = httpx.URL(raw_url).copy_set_param("nm", ";".join(str(item) for item in nm_ids))
         except Exception as exc:
-            raise AccountSessionError("Адрес WB Connector повреждён") from exc
+            raise AccountSessionError("Адрес персональной проверки WB повреждён") from exc
         headers = {
             str(name): str(value)
             for name, value in raw_headers.items()
@@ -677,10 +673,14 @@ class AccountWildberriesClient:
         )
         raw_cookies = storage_state.get("cookies")
         if not isinstance(raw_cookies, list):
-            raise AccountSessionError("Cookies WB Connector повреждены")
+            raise AccountSessionError("Cookies персональной WB-сессии повреждены")
         cookie_values: dict[str, str] = {}
         for item in raw_cookies:
-            if isinstance(item, dict) and item.get("name") and item.get("value"):
+            if isinstance(item, dict) and _cookie_matches_request(
+                item,
+                hostname="card.wb.ru",
+                request_path="/cards/v4/detail",
+            ):
                 cookie_values[str(item["name"])] = str(item["value"])
         if cookie_values:
             headers["Cookie"] = "; ".join(
@@ -689,11 +689,11 @@ class AccountWildberriesClient:
         try:
             response = await self._http.get(url, headers=headers)
         except httpx.HTTPError as exc:
-            raise AccountProviderError(f"Сеть WB Connector: {type(exc).__name__}") from exc
+            raise AccountProviderError(
+                f"Сеть персональной проверки WB: {type(exc).__name__}"
+            ) from exc
         if response.status_code in {401, 403}:
-            raise AccountSessionError(
-                "Сессия расширения истекла. Откройте WB и подключите аккаунт повторно."
-            )
+            raise AccountSessionError("Сессия Wildberries истекла. Подключите аккаунт повторно.")
         if response.status_code in {429, 498}:
             raise AccountProviderError(f"Wildberries временно ответил {response.status_code}")
         try:
@@ -702,7 +702,7 @@ class AccountWildberriesClient:
             products, variants = _parse_products(payload, "account_connector")
         except (httpx.HTTPError, ValueError, WildberriesError) as exc:
             raise AccountProviderError(
-                f"WB Connector получил неизвестный ответ ({response.status_code})"
+                f"Персональная проверка WB получила неизвестный ответ ({response.status_code})"
             ) from exc
         return FetchResult(products, variants=variants)
 
@@ -828,6 +828,32 @@ class AccountWildberriesClient:
         finally:
             with suppress(Exception):
                 page.remove_listener("response", on_response)
+
+
+def _cookie_matches_request(item: dict[str, Any], *, hostname: str, request_path: str) -> bool:
+    name = item.get("name")
+    value = item.get("value")
+    raw_domain = str(item.get("domain", "")).strip().lower()
+    if not name or not value or not raw_domain:
+        return False
+    domain = raw_domain.lstrip(".")
+    if raw_domain.startswith("."):
+        if hostname != domain and not hostname.endswith(f".{domain}"):
+            return False
+    elif hostname != domain:
+        return False
+    cookie_path = str(item.get("path", "/")) or "/"
+    if request_path != cookie_path:
+        if not request_path.startswith(cookie_path):
+            return False
+        boundary = request_path[len(cookie_path) : len(cookie_path) + 1]
+        if not cookie_path.endswith("/") and boundary != "/":
+            return False
+    expires = item.get("expires")
+    if isinstance(expires, int | float) and expires > 0:
+        if expires <= datetime.now(UTC).timestamp():
+            return False
+    return True
 
 
 def parse_price_text(text: str) -> int | None:

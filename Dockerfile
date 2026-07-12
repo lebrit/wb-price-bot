@@ -10,7 +10,6 @@ WORKDIR /app
 
 COPY pyproject.toml requirements.lock README.md VERSION ./
 COPY src ./src
-COPY extension ./extension
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl fonts-dejavu-core xauth \

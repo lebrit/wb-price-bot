@@ -8,9 +8,4 @@
         Referrer-Policy "no-referrer"
         -Server
     }
-
-    log {
-        output stdout
-        format json
-    }
 }

@@ -11,6 +11,7 @@ import pytest
 from wb_price_bot.config import Settings
 from wb_price_bot.domain import VariantSelection
 from wb_price_bot.wildberries import (
+    AccountProviderError,
     AccountWildberriesClient,
     MpstatsPriceClient,
     ProductReferenceError,
@@ -177,7 +178,26 @@ async def test_account_connector_uses_lightweight_authorized_request(
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     client = AccountWildberriesClient(settings, http)
     state = {
-        "cookies": [{"name": "wb-session", "value": "cookie-secret", "domain": ".wildberries.ru"}],
+        "cookies": [
+            {
+                "name": "wb-card-session",
+                "value": "card-cookie-secret",
+                "domain": ".wb.ru",
+                "path": "/",
+            },
+            {
+                "name": "wb-id-only",
+                "value": "must-not-leak",
+                "domain": "id.wb.ru",
+                "path": "/",
+            },
+            {
+                "name": "storefront-only",
+                "value": "must-not-leak-either",
+                "domain": ".wildberries.ru",
+                "path": "/",
+            },
+        ],
         "origins": [{"origin": "https://www.wildberries.ru", "localStorage": []}],
         "connector": {
             "version": 1,
@@ -192,7 +212,30 @@ async def test_account_connector_uses_lightweight_authorized_request(
     assert seen is not None
     assert seen.url.params["nm"] == "28436956"
     assert seen.headers["authorization"] == "Bearer connector-secret-token"
-    assert "wb-session=cookie-secret" in seen.headers["cookie"]
+    assert seen.headers["cookie"] == "wb-card-session=card-cookie-secret"
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_account_connector_does_not_launch_browser_on_transient_failure(
+    settings: Settings,
+) -> None:
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(498, text="challenge"))
+    )
+    client = AccountWildberriesClient(settings, http)
+    state = {
+        "cookies": [{"name": "wb-session", "value": "secret", "domain": ".wildberries.ru"}],
+        "origins": [{"origin": "https://www.wildberries.ru", "localStorage": []}],
+        "connector": {
+            "version": 1,
+            "cardUrl": "https://card.wb.ru/cards/v4/detail?appType=1&nm=1",
+            "headers": {"authorization": "Bearer connector-secret-token"},
+            "capturedAt": "2026-07-12T00:00:00Z",
+        },
+    }
+    with pytest.raises(AccountProviderError, match="Wildberries временно ответил 498"):
+        await client.fetch_many([28436956], json.dumps(state))
     await http.aclose()
 
 

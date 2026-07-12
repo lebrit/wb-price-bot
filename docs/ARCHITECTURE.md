@@ -2,21 +2,22 @@
 
 Проект рассчитан на один частный сервер и несколько доверенных Telegram-пользователей.
 Основной asyncio-процесс совмещает long polling Telegram и фоновый мониторинг. Отдельный
-auth-процесс обслуживает лёгкий WB Connector API; Caddy завершает TLS. Оба процесса
-приложения используют одну SQLite в WAL-режиме.
+auth-процесс обслуживает одноразовую Telegram Mini App-форму входа; Caddy завершает TLS.
+Оба процесса приложения используют одну SQLite в WAL-режиме.
 
 ```text
 Telegram ── aiogram handlers ──────────────── SQLite
                   │                            ├── users / access status
                   └── monitor ────────────────┼── products / history
                          ├── public WB         ├── encrypted WB sessions
-                         ├── account connector └── notification outbox
+                         ├── account HTTP      └── notification outbox
                          └── MPSTATS fallback
 
-Chrome/Edge extension ── Caddy HTTPS ── auth_web
-                                           ├── one-time pairing code
-                                           ├── strict WB session allowlist
-                                           └── encrypted storage_state
+Telegram Mini App ────── Caddy HTTPS ── auth_web
+                                           ├── signed Telegram initData
+                                           ├── phone / OTP (transient only)
+                                           ├── one temporary Chromium
+                                           └── encrypted storage_state ── SQLite
 ```
 
 ## Границы модулей
@@ -28,7 +29,8 @@ Chrome/Edge extension ── Caddy HTTPS ── auth_web
 - `monitor.py` — пакетные проверки, смена источника, ошибки и доставка outbox с retry/pacing.
 - `charts.py` / `exports.py` — PNG-графики и переносимые CSV/JSON без секретов.
 - `security.py` — нормализация browser storage state и Fernet.
-- `auth_web.py` — HTTPS API одноразовой привязки и выдача ZIP расширения.
+- `telegram_auth.py` — проверка подписи и срока действия Telegram Mini App `initData`.
+- `auth_web.py` — одноразовая форма, очередь и автоматизация входа в изолированном Chromium.
 - `cli.py` — healthcheck, backup, диагностика и операции установщика.
 
 Публичные товары дедуплицируются между пользователями в пределах одного цикла. Товары с
@@ -40,15 +42,22 @@ Chrome/Edge extension ── Caddy HTTPS ── auth_web
 независимых правил. У пользователя отдельно хранятся региональный `dest`, тихие часы и время
 дневной сводки. Координаты Telegram после преобразования в `dest` не сохраняются.
 
-`auth_sessions` хранит только случайный ID с 40-битным отображаемым префиксом, владельца,
-состояние и срок действия. Расширение отправляет код и сессию по HTTPS. Перед сохранением
-проверяются домены cookies/origins, точный `card.wb.ru/cards/v4/detail`, allowlist заголовков и
-наличие Bearer. Атомарная транзакция погашает код и сохраняет зашифрованную сессию только
-соответствующему Telegram ID. Подбор кода ограничен rate limit и десятиминутным TTL.
+`auth_sessions` хранит случайный ID, владельца, состояние и срок действия. WebSocket сначала
+проверяет подписанные Telegram `initData`, владельца и десятиминутный TTL. Затем запрос ожидает
+единственный браузерный слот: одновременно существует не более одного временного Chromium.
+Телефон и SMS-код живут только в памяти на время передачи по TLS и заполнения формы WB; они не
+записываются в SQLite и журналы. Кадры страницы и удалённое управление не передаются.
+
+После входа Chromium открывает карточку уже добавленного товара, чтобы получить авторизованный
+card-запрос. Перед сохранением проверяются домены cookies/origins, точный
+`card.wb.ru/cards/v4/detail`, allowlist заголовков и наличие Bearer. Атомарная транзакция
+погашает окно входа и сохраняет зашифрованную сессию только соответствующему Telegram ID.
+Chromium и его контекст уничтожаются сразу после завершения или ошибки. Если появляется
+CAPTCHA, вход прекращается без распознавания и обхода.
 
 При мониторинге `AccountWildberriesClient` сначала повторяет сохранённый авторизованный card
-request напрямую. Это не создаёт browser process. Playwright остаётся резервом при временном
-защитном ответе или изменении endpoint и никогда не используется для интерактивного входа.
+request напрямую. Штатная проверка не создаёт browser process; сохранённая сессия каждого
+пользователя остаётся изолированной от остальных.
 
 ## SQLite
 

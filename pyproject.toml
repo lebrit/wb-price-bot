@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wb-price-bot"
-version = "0.4.0"
+version = "0.5.0"
 description = "Telegram-бот для отслеживания цен Wildberries"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -36,9 +36,6 @@ wb-price-bot = "wb_price_bot.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/wb_price_bot"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"extension" = "wb_price_bot/extension"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

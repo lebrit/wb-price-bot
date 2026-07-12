@@ -21,7 +21,6 @@ from .database import (
     Database,
     ProductAlreadyExistsError,
     ProductLimitError,
-    auth_pairing_code,
 )
 from .domain import (
     PriceSnapshot,
@@ -35,7 +34,7 @@ from .domain import (
 from .features import register_feature_handlers
 from .keyboards import (
     access_review_keyboard,
-    account_connector_keyboard,
+    account_auth_keyboard,
     account_delete_confirmation,
     account_keyboard,
     account_warning_keyboard,
@@ -315,10 +314,10 @@ def create_router(context: HandlerContext) -> Router:
         cycle_age = seconds_since(database.last_monitor_cycle)
         cycle = "ещё не было" if cycle_age is None else f"{cycle_age} сек. назад"
         auth_ok = bool(auth_health and auth_health.get("ok"))
-        if auth_health and auth_health.get("mode") == "browser-extension":
+        if auth_health and auth_health.get("mode") == "telegram-form-browser":
             auth_slots = (
                 f"{auth_health.get('active', 0)} активно · "
-                f"{auth_health.get('pending', 0)} кодов ожидают"
+                f"{auth_health.get('pending', 0)} окон ожидают · лимит 1"
             )
         else:
             auth_slots = "недоступен"
@@ -697,8 +696,8 @@ def create_router(context: HandlerContext) -> Router:
             text = (
                 "👤 <b>Аккаунт Wildberries не подключён</b>\n\n"
                 "Бот использует публичную цену для выбранного региона. "
-                "Персональную сессию можно подключить одноразовым кодом через "
-                "расширение Chrome/Edge (beta)."
+                "Персональную сессию можно подключить через одноразовую форму "
+                "прямо в Telegram (beta)."
             )
         else:
             validated = (
@@ -732,9 +731,9 @@ def create_router(context: HandlerContext) -> Router:
                 "Wildberries не предоставляет официального API покупательских цен, а его "
                 "условия ограничивают автоматический сбор цен и наличия. Функция экспериментальная: "
                 "сессия может истечь, аккаунт может потребовать повторный вход.\n\n"
-                "Вход выполняется на настоящем сайте Wildberries в вашем браузере. Расширение "
-                "передаёт только активную сессию по одноразовому коду. Телефон, SMS-код и пароль "
-                "бот не получает; CAPTCHA не обходится.",
+                "Номер телефона и одноразовый код кратковременно проходят через ваш сервер по TLS "
+                "и вводятся в официальный сайт Wildberries. Они не сохраняются в базе, журналах "
+                "или снимках экрана. Администратору сервера необходимо доверять. CAPTCHA не обходится.",
                 reply_markup=account_warning_keyboard(),
             )
         await callback.answer()
@@ -749,8 +748,19 @@ def create_router(context: HandlerContext) -> Router:
             return
         if not context.settings.auth_enabled:
             await callback.message.edit_text(
-                "WB Connector не настроен на сервере. Укажите домен через "
-                "<code>sudo wb-price-bot</code> → «WB Connector».",
+                "Web-авторизация не настроена на сервере. Укажите домен через "
+                "<code>sudo wb-price-bot</code> → «Web-авторизация WB».",
+                reply_markup=account_keyboard(
+                    await context.database.get_wb_account(callback.from_user.id) is not None
+                ),
+            )
+            await callback.answer()
+            return
+        product = await context.database.get_first_product(callback.from_user.id)
+        if product is None:
+            await callback.message.edit_text(
+                "Сначала добавьте хотя бы один товар. После входа бот откроет его карточку, "
+                "чтобы проверить и сохранить лёгкий источник персональной цены.",
                 reply_markup=account_keyboard(
                     await context.database.get_wb_account(callback.from_user.id) is not None
                 ),
@@ -760,18 +770,14 @@ def create_router(context: HandlerContext) -> Router:
         auth_session = await context.database.create_auth_session(
             callback.from_user.id, context.settings.auth_session_ttl_seconds
         )
-        url = f"{context.settings.auth_public_url}/connect/{auth_session.id}"
-        extension_url = f"{context.settings.auth_public_url}/extension/wb-price-bot-connector.zip"
-        code = auth_pairing_code(auth_session.id)
+        url = f"{context.settings.auth_public_url}/login/{auth_session.id}"
         ttl_minutes = context.settings.auth_session_ttl_seconds // 60
         await callback.message.edit_text(
-            "🔌 <b>Код подключения WB Connector</b>\n\n"
-            f"<code>{code}</code>\n\n"
-            f"Код действует {ttl_minutes} мин. и привязан к вашему Telegram ID. "
-            "На компьютере установите расширение Chrome/Edge, войдите на wildberries.ru "
-            "обычным способом и введите в расширении адрес сервера и этот код. "
-            "На телефоне продолжает работать публичная цена без входа.",
-            reply_markup=account_connector_keyboard(url, extension_url),
+            "🔐 <b>Одноразовая форма входа готова</b>\n\n"
+            f"Она действует {ttl_minutes} мин. и привязана к вашему Telegram ID. "
+            "Введите номер и код внутри формы. После успешного входа временный браузер "
+            "закроется автоматически; расширение и компьютер не нужны.",
+            reply_markup=account_auth_keyboard(url),
         )
         await callback.answer()
 

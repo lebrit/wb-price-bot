@@ -198,5 +198,5 @@ def normalize_wb_session(
             "В браузерной сессии нет локальных данных Wildberries; завершите вход и повторите"
         )
     if require_connector and not state.get("connector"):
-        raise SessionFormatError("Подключите аккаунт через расширение WB Price Bot Connector")
+        raise SessionFormatError("WB не выдал данные для лёгкой проверки персональной цены")
     return json.dumps(state, ensure_ascii=False, separators=(",", ":"), sort_keys=True)

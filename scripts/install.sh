@@ -356,7 +356,7 @@ configure_first_install() {
   [[ "${interval}" =~ ^[0-9]+$ && "${interval}" -ge 900 ]] || die "неверный интервал"
   read_prompt destination "WB dest региона (Иркутск по умолчанию)" "-5827722"
   [[ "${destination}" =~ ^-?[0-9]+$ ]] || die "WB dest должен быть целым числом"
-  read_prompt domain "Домен WB Connector (A/AAAA-запись должна вести на сервер)"
+  read_prompt domain "Домен Web-авторизации WB (A/AAAA-запись должна вести на сервер)"
   domain="${domain,,}"
   validate_domain "${domain}" || die "укажите домен вида auth.example.com без https:// и пути"
   read_prompt registration "Режим регистрации: approval, open или allowlist" "approval"
@@ -371,7 +371,7 @@ ensure_auth_config() {
   local domain public_url registration
   domain="$(read_config_value AUTH_DOMAIN || true)"
   if [[ -z "${domain}" || "${domain}" == "localhost" ]] || ! validate_domain "${domain}"; then
-    read_prompt domain "Домен WB Connector"
+    read_prompt domain "Домен Web-авторизации WB"
     domain="${domain,,}"
     validate_domain "${domain}" || die "укажите домен вида auth.example.com"
     set_config_value AUTH_DOMAIN "${domain}"
@@ -644,7 +644,7 @@ wb_session_menu() {
   while true; do
     say
     say "Аккаунт Wildberries (beta)"
-    say "1) Показать инструкцию WB Connector"
+    say "1) Показать инструкцию Web-авторизации WB"
     say "2) Импортировать wb-session.json с сервера"
     say "3) Удалить WB-сессию"
     say "4) Проверить публичную карточку WB"
@@ -653,10 +653,12 @@ wb_session_menu() {
     case "${choice}" in
       1)
         say "Откройте в Telegram: /account → Подключить / обновить."
-        say "Бот выдаст одноразовый код и ссылку на расширение Chrome/Edge."
-        say "Войдите на wildberries.ru обычным способом и введите код в расширении."
-        say "Телефон и SMS-код серверу не передаются."
-        say "Скачать расширение: https://$(read_config_value AUTH_DOMAIN)/extension/wb-price-bot-connector.zip"
+        say "Сначала добавьте в бот хотя бы один товар."
+        say "Откройте /account → Подключить / обновить → Войти в Wildberries."
+        say "Введите телефон и SMS-код в одноразовой Telegram Mini App-форме."
+        say "Они передаются по TLS через ваш сервер, но не сохраняются и не пишутся в журнал."
+        say "После входа временный Chromium закроется; расширение или приложение не нужны."
+        say "Если WB запросит CAPTCHA, вход остановится без её распознавания или обхода."
         ;;
       2)
         read_prompt telegram_id "Telegram ID владельца сессии" "$(read_config_value TELEGRAM_ALLOWED_USERS | cut -d, -f1)"
@@ -769,13 +771,13 @@ web_auth_menu() {
   local choice value
   while true; do
     say
-    say "WB Connector и пользователи"
+    say "Web-авторизация WB"
     say "Домен: $(read_config_value AUTH_DOMAIN)"
     say "Регистрация: $(read_config_value REGISTRATION_MODE)"
     say "1) Изменить домен"
     say "2) Изменить режим регистрации"
-    say "3) Проверить HTTPS и Connector API"
-    say "4) Перезапустить Connector API"
+    say "3) Проверить HTTPS и Web-авторизацию"
+    say "4) Перезапустить Web-авторизацию"
     say "0) Назад"
     read_prompt choice "Выберите пункт"
     case "${choice}" in
@@ -799,14 +801,14 @@ web_auth_menu() {
         value="$(read_config_value AUTH_DOMAIN)"
         if curl -fsS --max-time 20 "https://${value}/health"; then
           say
-          say "HTTPS и Connector API: OK"
+          say "HTTPS и Web-авторизация WB: OK"
         else
           warn "проверка не прошла; проверьте DNS домена, доступность 80/443 и журнал Caddy"
         fi
         ;;
       4)
         compose_current restart auth caddy
-        wait_healthy 240 || warn "WB Connector ещё не healthy"
+        wait_healthy 240 || warn "Web-авторизация WB ещё не healthy"
         ;;
       0) return ;;
       *) warn "неизвестный пункт" ;;
@@ -915,9 +917,9 @@ doctor() {
     warn "Telegram getMe: ошибка"
   fi
   if curl -fsS --max-time 20 "$(read_config_value AUTH_PUBLIC_URL)/health" >/dev/null; then
-    say "WB Connector HTTPS: OK"
+    say "Web-авторизация WB HTTPS: OK"
   else
-    warn "WB Connector HTTPS: ошибка"
+    warn "Web-авторизация WB HTTPS: ошибка"
   fi
 }
 
@@ -979,7 +981,7 @@ menu_header() {
   say " ${APP_TITLE} v${version}"
   say " Сервис: ${status}; health: ${health}"
   [[ -n "${username}" ]] && say " Telegram: @${username}"
-  say " Auth: ${domain:-не настроен}"
+  say " Web-авторизация WB: ${domain:-не настроена}"
   say "========================================"
 }
 
@@ -1015,7 +1017,7 @@ command_menu() {
     say "8) Аккаунт Wildberries"
     say "9) Настройки мониторинга"
     say "10) Лицензированный источник MPSTATS"
-    say "11) WB Connector и пользователи"
+    say "11) Web-авторизация WB"
     say "12) Резервные копии"
     say "13) Диагностика"
     say "14) Удаление"
