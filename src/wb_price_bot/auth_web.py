@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 _WB_HOME = "https://www.wildberries.ru/"
 _WB_FALLBACK_HOME = "https://www.wildberries.by/"
-_VIEWPORT = {"width": 1080, "height": 900}
+_VIEWPORT = {"width": 720, "height": 800}
 _MAX_OTP_ATTEMPTS = 5
 _PHONE_SELECTORS = (
     'input[autocomplete="tel"]',
@@ -332,9 +332,10 @@ class AuthWebService:
         await ws.send_json({"type": "status", "text": "Запускаю одноразовый браузер Wildberries…"})
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(
-                headless=False,
+                headless=True,
                 args=[
                     "--no-sandbox",
+                    "--disable-gpu",
                     "--disable-dev-shm-usage",
                     "--disable-background-networking",
                     "--disable-component-update",
@@ -354,6 +355,8 @@ class AuthWebService:
                     service_workers="block",
                 )
                 page = await context.new_page()
+                page.set_default_timeout(5_000)
+                page.set_default_navigation_timeout(30_000)
                 inspection_tasks: set[asyncio.Task[None]] = set()
 
                 def on_popup(popup: Any) -> None:
