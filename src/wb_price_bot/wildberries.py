@@ -651,8 +651,16 @@ class AccountWildberriesClient:
             raise AccountProviderError("В сессии нет данных лёгкой проверки WB")
         raw_url = connector.get("cardUrl")
         raw_headers = connector.get("headers")
+        storefront_origin = str(
+            connector.get("storefrontOrigin", "https://www.wildberries.ru")
+        ).rstrip("/")
         if not isinstance(raw_url, str) or not isinstance(raw_headers, dict):
             raise AccountSessionError("Персональная WB-сессия повреждена")
+        if storefront_origin not in {
+            "https://www.wildberries.ru",
+            "https://www.wildberries.by",
+        }:
+            raise AccountSessionError("Домен персональной WB-сессии повреждён")
         try:
             url = httpx.URL(raw_url).copy_set_param("nm", ";".join(str(item) for item in nm_ids))
         except Exception as exc:
@@ -666,8 +674,8 @@ class AccountWildberriesClient:
             {
                 "Accept": "application/json, text/plain, */*",
                 "Accept-Language": "ru-RU,ru;q=0.9",
-                "Origin": "https://www.wildberries.ru",
-                "Referer": "https://www.wildberries.ru/",
+                "Origin": storefront_origin,
+                "Referer": f"{storefront_origin}/",
                 "User-Agent": _CONNECTOR_USER_AGENT,
             }
         )

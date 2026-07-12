@@ -46,6 +46,8 @@ def _allowed_cookie_domain(domain: str) -> bool:
         or normalized.endswith(".wb.ru")
         or normalized == "wildberries.ru"
         or normalized.endswith(".wildberries.ru")
+        or normalized == "wildberries.by"
+        or normalized.endswith(".wildberries.by")
     )
 
 
@@ -54,6 +56,7 @@ def _allowed_origin(origin: str) -> bool:
         "https://www.wildberries.ru",
         "https://wildberries.ru",
         "https://global.wildberries.ru",
+        "https://www.wildberries.by",
         "https://id.wb.ru",
     }
 
@@ -135,11 +138,20 @@ def _sanitize_connector(payload: Any) -> dict[str, Any] | None:
             "Авторизация WB не обнаружена. Обновите страницу Wildberries и повторите."
         )
     captured_at = str(payload.get("capturedAt", ""))[:64]
+    storefront_origin = str(payload.get("storefrontOrigin", "https://www.wildberries.ru")).rstrip(
+        "/"
+    )
+    if storefront_origin not in {
+        "https://www.wildberries.ru",
+        "https://www.wildberries.by",
+    }:
+        raise SessionFormatError("Сессия передала неизвестный домен витрины WB")
     return {
         "version": 1,
         "cardUrl": card_url,
         "headers": headers,
         "capturedAt": captured_at,
+        "storefrontOrigin": storefront_origin,
     }
 
 

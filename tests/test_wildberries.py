@@ -204,6 +204,7 @@ async def test_account_connector_uses_lightweight_authorized_request(
             "cardUrl": "https://card.wb.ru/cards/v4/detail?appType=1&nm=1",
             "headers": {"authorization": "Bearer connector-secret-token"},
             "capturedAt": "2026-07-12T00:00:00Z",
+            "storefrontOrigin": "https://www.wildberries.by",
         },
     }
     result = await client.fetch_many([28436956], json.dumps(state))
@@ -213,6 +214,8 @@ async def test_account_connector_uses_lightweight_authorized_request(
     assert seen.url.params["nm"] == "28436956"
     assert seen.headers["authorization"] == "Bearer connector-secret-token"
     assert seen.headers["cookie"] == "wb-card-session=card-cookie-secret"
+    assert seen.headers["origin"] == "https://www.wildberries.by"
+    assert seen.headers["referer"] == "https://www.wildberries.by/"
     await http.aclose()
 
 

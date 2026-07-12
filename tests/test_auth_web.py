@@ -17,9 +17,12 @@ from wb_price_bot.auth_web import (
     _allowed_wb_navigation,
     _connector_confirms_account,
     _contains_captcha,
+    _localized_connector_url,
     _login_feedback,
     _normalize_code,
     _normalize_phone,
+    _open_phone_form,
+    _phone_country,
 )
 from wb_price_bot.config import Settings
 from wb_price_bot.database import Database
@@ -32,6 +35,51 @@ class FakeBot:
 
     async def send_message(self, telegram_id: int, text: str, **__: Any) -> None:
         self.messages.append((telegram_id, text))
+
+
+class FakeWebSocket:
+    def __init__(self) -> None:
+        self.messages: list[dict[str, Any]] = []
+
+    async def send_json(self, value: dict[str, Any]) -> None:
+        self.messages.append(value)
+
+
+class FakeLocator:
+    def __init__(self, present: bool) -> None:
+        self.present = present
+
+    async def count(self) -> int:
+        return int(self.present)
+
+    def nth(self, _: int) -> FakeLocator:
+        return self
+
+    async def is_visible(self) -> bool:
+        return self.present
+
+    async def is_enabled(self) -> bool:
+        return self.present
+
+
+class FallbackStorefrontPage:
+    def __init__(self) -> None:
+        self.url = "about:blank"
+        self.visited: list[str] = []
+
+    async def goto(self, url: str, **__: Any) -> Any:
+        self.url = url
+        self.visited.append(url)
+        return type("Response", (), {"status": 498 if url.endswith(".ru/") else 200})()
+
+    async def wait_for_load_state(self, *_: Any, **__: Any) -> None:
+        return None
+
+    def locator(self, selector: str) -> FakeLocator:
+        return FakeLocator(
+            self.url.startswith("https://www.wildberries.by")
+            and selector == 'input[autocomplete="tel"]'
+        )
 
 
 def _signed_init_data(token: str, telegram_id: int) -> str:
@@ -102,6 +150,24 @@ async def test_form_page_is_one_time_and_has_no_remote_screen(settings: Settings
 
 
 @pytest.mark.asyncio
+async def test_phone_form_uses_official_fallback_after_498() -> None:
+    page = FallbackStorefrontPage()
+    websocket = FakeWebSocket()
+    locator, origin = await _open_phone_form(
+        page,
+        websocket,  # type: ignore[arg-type]
+        TimeoutError,
+    )
+    assert locator.present is True
+    assert origin == "https://www.wildberries.by"
+    assert page.visited == [
+        "https://www.wildberries.ru/",
+        "https://www.wildberries.by/",
+    ]
+    assert any("резервный домен" in item["text"] for item in websocket.messages)
+
+
+@pytest.mark.asyncio
 async def test_websocket_rejects_foreign_origin_and_unsigned_telegram(
     settings: Settings,
 ) -> None:
@@ -167,6 +233,13 @@ def test_phone_normalization(raw: str, expected: str) -> None:
     assert _normalize_phone(raw) == expected
 
 
+def test_phone_country_for_official_fallback_form() -> None:
+    assert _phone_country("+79991234567") == "ru"
+    assert _phone_country("+375291234567") == "by"
+    assert _phone_country("+37499123456") == "am"
+    assert _phone_country("+12025550123") is None
+
+
 @pytest.mark.parametrize("raw", ["", "123", "123456789", "+7 abc 123"])
 def test_phone_or_code_rejects_invalid_values(raw: str) -> None:
     with pytest.raises(ValueError):
@@ -186,11 +259,23 @@ def test_code_and_feedback_helpers() -> None:
     assert _connector_confirms_account("", "public", "") is False
     assert _connector_confirms_account("same", "same", "0") is False
     assert _connector_confirms_account("", "account", "123456") is True
+    localized = _localized_connector_url(
+        "https://card.wb.ru/cards/v4/detail?appType=1&curr=byn&dest=123&nm=42",
+        currency="rub",
+        language="ru",
+        destination=-5827722,
+    )
+    assert "curr=rub" in localized
+    assert "dest=-5827722" in localized
+    assert "lang=ru" in localized
+    assert "nm=42" in localized
 
 
 def test_navigation_guard_does_not_accept_lookalike_domains() -> None:
     assert _allowed_wb_navigation("https://www.wildberries.ru/lk") is True
+    assert _allowed_wb_navigation("https://www.wildberries.by/lk") is True
     assert _allowed_wb_navigation("https://id.wb.ru/") is True
     assert _allowed_wb_navigation("about:blank") is True
     assert _allowed_wb_navigation("https://wildberries.ru.evil.example/") is False
+    assert _allowed_wb_navigation("https://wildberries.by.evil.example/") is False
     assert _allowed_wb_navigation("http://www.wildberries.ru/") is False

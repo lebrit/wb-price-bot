@@ -32,6 +32,12 @@ def test_normalize_playwright_state_filters_unrelated_domains() -> None:
                     "domain": ".example.com",
                     "path": "/",
                 },
+                {
+                    "name": "wb-by-session",
+                    "value": "secret-by",
+                    "domain": ".wildberries.by",
+                    "path": "/",
+                },
             ],
             "origins": [
                 {
@@ -42,12 +48,22 @@ def test_normalize_playwright_state_filters_unrelated_domains() -> None:
                     "origin": "https://example.com",
                     "localStorage": [{"name": "bad", "value": "leak"}],
                 },
+                {
+                    "origin": "https://www.wildberries.by",
+                    "localStorage": [{"name": "token-by", "value": "opaque-by"}],
+                },
             ],
         }
     )
     normalized = json.loads(normalize_wb_session(raw))
-    assert [item["name"] for item in normalized["cookies"]] == ["wb-session"]
-    assert [item["origin"] for item in normalized["origins"]] == ["https://www.wildberries.ru"]
+    assert [item["name"] for item in normalized["cookies"]] == [
+        "wb-session",
+        "wb-by-session",
+    ]
+    assert [item["origin"] for item in normalized["origins"]] == [
+        "https://www.wildberries.ru",
+        "https://www.wildberries.by",
+    ]
 
 
 def test_session_without_browser_origin_is_rejected_by_default() -> None:
@@ -93,6 +109,7 @@ def test_connector_metadata_is_filtered_and_can_be_required() -> None:
                     "evil-header": "leak",
                 },
                 "capturedAt": "2026-07-12T00:00:00Z",
+                "storefrontOrigin": "https://www.wildberries.by",
             },
         }
     )
@@ -101,6 +118,7 @@ def test_connector_metadata_is_filtered_and_can_be_required() -> None:
         "authorization": "Bearer connector-secret-token",
         "x-userid": "123",
     }
+    assert normalized["connector"]["storefrontOrigin"] == "https://www.wildberries.by"
 
 
 def test_connector_rejects_non_wb_card_url() -> None:

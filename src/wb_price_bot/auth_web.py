@@ -11,7 +11,7 @@ import time
 from collections import defaultdict, deque
 from datetime import UTC, datetime
 from typing import Any, cast
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
@@ -26,7 +26,7 @@ from .telegram_auth import TelegramInitDataError, validate_init_data
 logger = logging.getLogger(__name__)
 
 _WB_HOME = "https://www.wildberries.ru/"
-_WB_ACCOUNT = "https://www.wildberries.ru/lk"
+_WB_FALLBACK_HOME = "https://www.wildberries.by/"
 _VIEWPORT = {"width": 1080, "height": 900}
 _MAX_OTP_ATTEMPTS = 5
 _PHONE_SELECTORS = (
@@ -450,7 +450,9 @@ class AuthWebService:
                 page.on("response", on_response)
                 try:
                     try:
-                        phone_input = await _open_phone_form(page, ws, PlaywrightTimeoutError)
+                        phone_input, storefront_origin = await _open_phone_form(
+                            page, ws, PlaywrightTimeoutError
+                        )
                         await ws.send_json(
                             {"type": "status", "text": "Запрашиваю код у Wildberries…"}
                         )
@@ -499,7 +501,7 @@ class AuthWebService:
                             card_seen.clear()
                             connector.clear()
                             await page.goto(
-                                f"https://www.wildberries.ru/catalog/{product.nm_id}/detail.aspx",
+                                f"{storefront_origin}/catalog/{product.nm_id}/detail.aspx",
                                 wait_until="domcontentloaded",
                                 timeout=45_000,
                             )
@@ -527,6 +529,19 @@ class AuthWebService:
                                 raise LoginFlowError(
                                     "WB не выдал персональный токен после входа. Повторите позже."
                                 )
+                            user = await self.database.get_user(telegram_id)
+                            destination = (
+                                user.wb_destination
+                                if user is not None and user.wb_destination is not None
+                                else self.settings.wb_destination
+                            )
+                            connector["cardUrl"] = _localized_connector_url(
+                                str(connector["cardUrl"]),
+                                currency=self.settings.wb_currency,
+                                language=self.settings.wb_language,
+                                destination=destination,
+                            )
+                            connector["storefrontOrigin"] = storefront_origin
                             try:
                                 raw_state = await context.storage_state(indexed_db=True)
                             except TypeError:
@@ -697,20 +712,44 @@ class AuthWebService:
 
 async def _open_phone_form(
     page: Any, ws: web.WebSocketResponse, timeout_error: type[Exception]
-) -> Any:
+) -> tuple[Any, str]:
     await ws.send_json({"type": "status", "text": "Открываю официальный сайт Wildberries…"})
-    try:
-        await page.goto(_WB_HOME, wait_until="domcontentloaded", timeout=45_000)
-    except timeout_error:
-        with contextlib.suppress(Exception):
-            await page.evaluate("window.stop()")
+    storefront_origin = ""
+    blocked = False
+    for home in (_WB_HOME, _WB_FALLBACK_HOME):
+        try:
+            response = await page.goto(home, wait_until="commit", timeout=20_000)
+        except timeout_error:
+            continue
+        if response is not None and response.status in {403, 429, 498}:
+            blocked = True
+            if home == _WB_HOME:
+                await ws.send_json(
+                    {
+                        "type": "status",
+                        "text": "Основной домен WB запросил защитную проверку; открываю официальный резервный домен…",
+                    }
+                )
+            continue
+        parsed = urlparse(page.url)
+        if parsed.scheme == "https" and parsed.hostname:
+            storefront_origin = f"https://{parsed.hostname}"
+        else:
+            storefront_origin = home.rstrip("/")
+        with contextlib.suppress(timeout_error):
+            await page.wait_for_load_state("domcontentloaded", timeout=20_000)
+        break
+    if not storefront_origin:
+        if blocked:
+            raise CaptchaRequired
+        raise LoginFlowError("Wildberries не ответил. Повторите вход позже.")
     started = asyncio.get_running_loop().time()
     clicked = False
     opened_account = False
     while asyncio.get_running_loop().time() - started < 65:
         phone = await _unique_visible(page, _PHONE_SELECTORS, "поле телефона")
         if phone is not None:
-            return phone
+            return phone, storefront_origin
         if await _captcha_element_visible(page):
             raise CaptchaRequired
         if not clicked:
@@ -718,7 +757,13 @@ async def _open_phone_form(
         if not opened_account and asyncio.get_running_loop().time() - started > 15:
             opened_account = True
             try:
-                await page.goto(_WB_ACCOUNT, wait_until="domcontentloaded", timeout=35_000)
+                await page.goto(
+                    f"{storefront_origin}/lk",
+                    wait_until="commit",
+                    timeout=20_000,
+                )
+                with contextlib.suppress(timeout_error):
+                    await page.wait_for_load_state("domcontentloaded", timeout=15_000)
             except timeout_error:
                 with contextlib.suppress(Exception):
                     await page.evaluate("window.stop()")
@@ -730,9 +775,34 @@ async def _open_phone_form(
 
 
 async def _submit_phone(page: Any, phone_input: Any, phone: str) -> None:
+    await _select_phone_country(page, phone)
     await phone_input.fill(phone)
     if not await _click_unique(page, _SUBMIT_SELECTORS, "кнопку отправки кода"):
         await phone_input.press("Enter")
+
+
+async def _select_phone_country(page: Any, phone: str) -> None:
+    country = _phone_country(phone)
+    container = page.locator('[data-testid="auth-phone-input-mask-input-countries"]')
+    if await container.count() == 0:
+        return
+    if country is None:
+        raise LoginFlowError("Страна номера пока не поддерживается формой Wildberries")
+    radio = page.locator(f'input[type="radio"][name="phoneNumber"][value="{country}"]')
+    if await radio.count() != 1:
+        raise LoginFlowError("Wildberries не показал нужную страну номера")
+    if await radio.is_checked():
+        return
+    opener = container.locator('[data-class="btn"]')
+    if await opener.count() != 1:
+        raise LoginFlowError("Wildberries изменил выбор страны номера")
+    await opener.click()
+    label = page.locator(f'label[data-testid="{country}"]')
+    if await label.count() != 1 or not await label.is_visible():
+        raise LoginFlowError("Wildberries не показал нужную страну номера")
+    await label.click()
+    if not await radio.is_checked():
+        raise LoginFlowError("Wildberries не применил страну номера")
 
 
 async def _wait_for_code_form(page: Any, max_wait_seconds: float = 45.0) -> list[Any]:
@@ -940,6 +1010,24 @@ def _normalize_phone(raw: str) -> str:
     return "+" + digits
 
 
+def _phone_country(phone: str) -> str | None:
+    prefixes = (
+        ("+375", "by"),
+        ("+374", "am"),
+        ("+996", "kg"),
+        ("+998", "uz"),
+        ("+992", "tj"),
+        ("+995", "ge"),
+        ("+972", "il"),
+        ("+251", "et"),
+        ("+886", "cn2"),
+        ("+86", "cn"),
+        ("+85", "cn1"),
+        ("+7", "ru"),
+    )
+    return next((country for prefix, country in prefixes if phone.startswith(prefix)), None)
+
+
 def _normalize_code(raw: str) -> str:
     value = raw.strip().replace(" ", "")
     if not value.isdecimal() or len(value) < 4 or len(value) > 8:
@@ -961,6 +1049,24 @@ def _connector_confirms_account(
     return has_user_marker or bearer_changed
 
 
+def _localized_connector_url(
+    raw_url: str, *, currency: str, language: str, destination: int
+) -> str:
+    parsed = urlparse(raw_url)
+    if parsed.scheme != "https" or parsed.hostname != "card.wb.ru":
+        raise LoginFlowError("WB вернул небезопасный адрес персональной цены")
+    parameters = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    parameters.update(
+        {
+            "appType": parameters.get("appType", "1") or "1",
+            "curr": currency,
+            "dest": str(destination),
+            "lang": language,
+        }
+    )
+    return urlunparse(parsed._replace(query=urlencode(parameters)))
+
+
 def _allowed_wb_navigation(url: str) -> bool:
     parsed = urlparse(url)
     if parsed.scheme == "about" and parsed.path == "blank":
@@ -968,8 +1074,8 @@ def _allowed_wb_navigation(url: str) -> bool:
     if parsed.scheme != "https" or not parsed.hostname:
         return False
     hostname = parsed.hostname.lower()
-    return hostname in {"wildberries.ru", "wb.ru"} or hostname.endswith(
-        (".wildberries.ru", ".wb.ru")
+    return hostname in {"wildberries.ru", "wildberries.by", "wb.ru"} or hostname.endswith(
+        (".wildberries.ru", ".wildberries.by", ".wb.ru")
     )
 
 

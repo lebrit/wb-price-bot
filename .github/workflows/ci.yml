@@ -51,4 +51,4 @@ jobs:
           --tmpfs /tmp:size=256m,noexec,nosuid
           --tmpfs /tmp/.X11-unix:mode=1777
           wb-price-bot:ci
-          python -m wb_price_bot version | grep -Fx 0.5.0
+          python -m wb_price_bot version | grep -Fx 0.5.1
