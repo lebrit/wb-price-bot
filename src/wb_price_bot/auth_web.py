@@ -30,6 +30,7 @@ _WB_FALLBACK_HOME = "https://www.wildberries.by/"
 _VIEWPORT = {"width": 720, "height": 800}
 _MAX_OTP_ATTEMPTS = 5
 _PHONE_SELECTORS = (
+    'input[data-testid="phoneInput"]',
     'input[autocomplete="tel"]',
     'input[type="tel"]',
     'input[inputmode="tel"]',
@@ -720,8 +721,12 @@ async def _open_phone_form(
     storefront_origin = ""
     blocked = False
     for home in (_WB_HOME, _WB_FALLBACK_HOME):
+        expected_origin = home.rstrip("/")
+        login_url = (
+            f"{expected_origin}/security/login?{urlencode({'returnUrl': f'{expected_origin}/'})}"
+        )
         try:
-            response = await page.goto(home, wait_until="commit", timeout=20_000)
+            response = await page.goto(login_url, wait_until="commit", timeout=20_000)
         except timeout_error:
             continue
         if response is not None and response.status in {403, 429, 498}:
@@ -738,7 +743,7 @@ async def _open_phone_form(
         if parsed.scheme == "https" and parsed.hostname:
             storefront_origin = f"https://{parsed.hostname}"
         else:
-            storefront_origin = home.rstrip("/")
+            storefront_origin = expected_origin
         with contextlib.suppress(timeout_error):
             await page.wait_for_load_state("domcontentloaded", timeout=20_000)
         break
@@ -750,14 +755,15 @@ async def _open_phone_form(
     clicked = False
     opened_account = False
     while asyncio.get_running_loop().time() - started < 65:
+        elapsed = asyncio.get_running_loop().time() - started
         phone = await _unique_visible(page, _PHONE_SELECTORS, "поле телефона")
         if phone is not None:
             return phone, storefront_origin
         if await _captcha_element_visible(page):
             raise CaptchaRequired
-        if not clicked:
+        if not clicked and elapsed > 10:
             clicked = await _click_unique(page, _LOGIN_TRIGGER_SELECTORS, "кнопку входа")
-        if not opened_account and asyncio.get_running_loop().time() - started > 15:
+        if not opened_account and elapsed > 15:
             opened_account = True
             try:
                 await page.goto(

@@ -70,7 +70,7 @@ class FallbackStorefrontPage:
     async def goto(self, url: str, **__: Any) -> Any:
         self.url = url
         self.visited.append(url)
-        return type("Response", (), {"status": 498 if url.endswith(".ru/") else 200})()
+        return type("Response", (), {"status": 498 if "wildberries.ru" in url else 200})()
 
     async def wait_for_load_state(self, *_: Any, **__: Any) -> None:
         return None
@@ -161,8 +161,8 @@ async def test_phone_form_uses_official_fallback_after_498() -> None:
     assert locator.present is True
     assert origin == "https://www.wildberries.by"
     assert page.visited == [
-        "https://www.wildberries.ru/",
-        "https://www.wildberries.by/",
+        "https://www.wildberries.ru/security/login?returnUrl=https%3A%2F%2Fwww.wildberries.ru%2F",
+        "https://www.wildberries.by/security/login?returnUrl=https%3A%2F%2Fwww.wildberries.by%2F",
     ]
     assert any("резервный домен" in item["text"] for item in websocket.messages)
 

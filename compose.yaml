@@ -2,7 +2,7 @@ services:
   bot:
     build:
       context: .
-    image: wb-price-bot:${APP_VERSION:-0.5.2}
+    image: wb-price-bot:${APP_VERSION:-0.5.3}
     container_name: wb-price-bot
     restart: unless-stopped
     init: true
@@ -42,7 +42,7 @@ services:
         max-file: "5"
 
   auth:
-    image: wb-price-bot:${APP_VERSION:-0.5.2}
+    image: wb-price-bot:${APP_VERSION:-0.5.3}
     container_name: wb-price-bot-auth
     entrypoint: ["python", "-m", "wb_price_bot", "auth-server"]
     command: []
